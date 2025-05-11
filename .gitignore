@@ -7,6 +7,10 @@ __pycache__/
 *.key
 *.secret
 *.pem
-config.py
-LLMConfig.py
-Data/historical/
+.venv/
+*.pyc
+dist/, build/
+.Data/historical/
+.models/
+
+
