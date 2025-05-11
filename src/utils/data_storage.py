@@ -52,7 +52,10 @@ def save_ohlcv(symbol: str, timeframe: str, ohlcv: List[List[Any]]) -> None:
     df = pd.DataFrame(ohlcv, columns=["timestamp", "open", "high", "low", "close", "volume"])
     path = get_historical_path(symbol, timeframe)
     if os.path.exists(path):
-        old = pd.read_csv(path)
+        try:
+            old = pd.read_csv(path)
+        except pd.errors.EmptyDataError:
+            old = pd.DataFrame()
         combined = pd.concat([old, df], ignore_index=True)
         # Group by timestamp and merge rows
         merged = combined.groupby("timestamp", as_index=False).agg(lambda x: x.dropna().max() if x.name != "volume" else x.dropna().sum())

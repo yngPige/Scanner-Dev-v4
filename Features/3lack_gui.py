@@ -498,7 +498,7 @@ Do NOT provide trading recommendations, entry/exit prices, or any rationale for 
                 html += "<b>Orders:</b> " + "; ".join(orders) + "<br>"
         return html
 
-    def add_technical_indicators(self, df: pd.DataFrame) -> pd.DataFrame:
+    def add_technical_indicators(self, df: pd.DataFrame, min_rows: int = 35) -> pd.DataFrame:
         """
         Add a suite of technical indicators to the OHLCV DataFrame using pandas_ta default column names for all indicators.
         """
@@ -549,6 +549,10 @@ Do NOT provide trading recommendations, entry/exit prices, or any rationale for 
         df = df.dropna().reset_index(drop=True)
         logging.info("[PROFILE] Indicator timings: %s", timings)
         print("[PROFILE] Indicator timings:", timings)
+        # Ensure at least min_rows after cleaning
+        valid_rows = len(df.dropna(subset=["open", "high", "low", "close", "volume"]))
+        if valid_rows < min_rows:
+            raise ValueError(f"Not enough valid data for indicator calculation. At least {min_rows} rows are required after cleaning. Valid rows: {valid_rows}")
         return df
 
     def train_model(self):
@@ -591,6 +595,11 @@ Do NOT provide trading recommendations, entry/exit prices, or any rationale for 
                 "1M": 12,
             }
             rows = timeframe_limits.get(timeframe, 100)
+        # Prompt for minimum rows
+        min_rows, ok = QInputDialog.getInt(self, "Minimum Rows Required", "Enter minimum number of valid rows for training:", 35, 10, 500, 1)
+        if not ok:
+            self.llm_output.append("<b>[ML Training]</b> Training cancelled by user (min rows dialog).")
+            return
         confirm = QMessageBox.question(
             self,
             "Download Historical Data",
@@ -628,15 +637,15 @@ Do NOT provide trading recommendations, entry/exit prices, or any rationale for 
         if df_hist.empty:
             self.llm_output.setHtml("<b>[ML Training]</b> No historical data available for this symbol/timeframe.")
             return
-        # Ensure at least 35 rows after cleaning
+        # Ensure at least min_rows after cleaning
         valid_rows = len(df_hist.dropna(subset=["open", "high", "low", "close", "volume"]))
         self.llm_output.append(f"<b>[ML Training]</b> Valid rows after cleaning: {valid_rows}")
-        if valid_rows < 35:
-            QMessageBox.warning(self, "Not Enough Data", "Not enough valid data for indicator calculation. At least 35 rows are required after cleaning. Please select a longer timeframe or fetch more data.")
-            self.llm_output.setHtml(f"<b>[ML Training]</b> Not enough valid data for indicator calculation. At least 35 rows are required after cleaning. Valid rows: {valid_rows}")
+        if valid_rows < min_rows:
+            QMessageBox.warning(self, "Not Enough Data", f"Not enough valid data for indicator calculation. At least {min_rows} rows are required after cleaning. Please select a longer timeframe or fetch more data.")
+            self.llm_output.setHtml(f"<b>[ML Training]</b> Not enough valid data for indicator calculation. At least {min_rows} rows are required after cleaning. Valid rows: {valid_rows}")
             return
         try:
-            df_hist = self.add_technical_indicators(df_hist)
+            df_hist = self.add_technical_indicators(df_hist, min_rows=min_rows)
         except ValueError as e:
             self.llm_output.setHtml(f"<b>[ML Training]</b> {e}")
             return
@@ -739,16 +748,21 @@ Do NOT provide trading recommendations, entry/exit prices, or any rationale for 
             self.llm_output.setHtml("<b>[ML Training]</b> No valid historical data available for this symbol/timeframe.")
             return
         df_hist = df_hist.rename(columns={col: col.lower() for col in df_hist.columns})
-        # Ensure at least 35 rows after cleaning
+        # Prompt for minimum rows
+        min_rows, ok = QInputDialog.getInt(self, "Minimum Rows Required", "Enter minimum number of valid rows for training:", 35, 10, 500, 1)
+        if not ok:
+            self.llm_output.append("<b>[ML Training]</b> Training cancelled by user (min rows dialog).")
+            return
+        # Ensure at least min_rows after cleaning
         valid_rows = len(df_hist.dropna(subset=["open", "high", "low", "close", "volume"]))
         self.llm_output.append(f"<b>[ML Training]</b> Valid rows after cleaning: {valid_rows}")
-        if valid_rows < 35:
+        if valid_rows < min_rows:
             self.progress_bar.setVisible(False)
-            QMessageBox.warning(self, "Not Enough Data", "Not enough valid data for indicator calculation. At least 35 rows are required after cleaning. Please select a longer timeframe or fetch more data.")
-            self.llm_output.setHtml(f"<b>[ML Training]</b> Not enough valid data for indicator calculation. At least 35 rows are required after cleaning. Valid rows: {valid_rows}")
+            QMessageBox.warning(self, "Not Enough Data", f"Not enough valid data for indicator calculation. At least {min_rows} rows are required after cleaning. Please select a longer timeframe or fetch more data.")
+            self.llm_output.setHtml(f"<b>[ML Training]</b> Not enough valid data for indicator calculation. At least {min_rows} rows are required after cleaning. Valid rows: {valid_rows}")
             return
         try:
-            df_hist = self.add_technical_indicators(df_hist)
+            df_hist = self.add_technical_indicators(df_hist, min_rows=min_rows)
         except ValueError as e:
             self.progress_bar.setVisible(False)
             self.llm_output.setHtml(f"<b>[ML Training]</b> {e}")
