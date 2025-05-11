@@ -17,13 +17,15 @@
 - **GUI Trading Terminal**: Intuitive PyQt6 interface for data exploration, ML/LLM analysis, and reporting.
 - **Exchange Integration**: Fetches OHLCV and ticker data from OKX using `ccxt`.
 - **Machine Learning**: Built-in ML models (RandomForest, GradientBoosting, SVM, XGBoost) for market prediction, with training and backtesting.
+- **User-Configurable Training**: Set the minimum number of valid rows for ML training via a dialog (default: 35, range: 10-500).
 - **Technical Indicators**: Computes dozens of indicators using `pandas-ta` (all features use pandas_ta default column names for model compatibility).
+- **Crypto Price Formatting**: All crypto prices (open, high, low, close, support/resistance, etc.) are displayed with 4 decimal places for clarity and consistency.
 - **LLM Analysis**: Integrates with local Ollama LLMs for technical summaries (prompt includes symbol, timeframe, and data range context).
 - **Historical Data Management**: Download, store, and analyze historical OHLCV data.
 - **Export & Reporting**: Export analysis and reports (CSV, PDF planned).
 - **Batch Download & Backtesting**: Download bulk data and run walk-forward ML backtests.
 - **Comprehensive ML Analysis Output**: ML results are formatted as a detailed, visually clear HTML summary (tables, color highlights, sections).
-- **Style/Visual Improvements**: Confidence and current price are highlighted in yellow for clarity.
+- **Improved Error Handling**: User-friendly error dialogs and feedback for missing/insufficient data.
 - **Extensible**: Modular codebase for adding new exchanges, models, or analytics.
 
 ---
@@ -32,8 +34,8 @@
 
 ### 1. **Clone the Repository**
 ```bash
-git clone <your-repo-url>
-cd "3lacks Scanner"
+git clone https://github.com/yngPige/Dev.git
+cd "Scanner Dev v4"
 ```
 
 ### 2. **Create and Activate a Virtual Environment**
@@ -64,7 +66,7 @@ python Features/3lack_gui.py
 ```
 
 - **Data Fetching**: Select exchange, pair, and timeframe. Fetch real-time or historical data.
-- **ML Analysis**: Choose ML algorithm, train models, and analyze market data. Results are shown in a comprehensive HTML summary (with tables, color, and sections).
+- **ML Analysis**: Choose ML algorithm, set minimum row count, train models, and analyze market data. Results are shown in a comprehensive HTML summary (with tables, color, and sections).
 - **LLM Analysis**: Select LLM model (Ollama), generate technical summaries. LLM prompt includes symbol, timeframe, and data range for context.
 - **Backtesting**: Run walk-forward ML backtests.
 - **Export**: Export analysis and reports (CSV, PDF planned).
@@ -73,6 +75,32 @@ python Features/3lack_gui.py
 ```bash
 pytest tests/
 ```
+
+---
+
+## Git & Version Control Best Practices
+
+- **.gitignore**: Ensure your `.gitignore` includes:
+  ```
+  __pycache__/
+  .venv/
+  *.pyc
+  .env
+  dist/
+  build/
+  Data/
+  ```
+- **Pushing to GitHub**:
+  ```bash
+  git add .
+  git commit -m "Your commit message"
+  git push origin main
+  # Or, for first push:
+  git branch -M main
+  git remote add origin git@github.com:yngPige/Dev.git
+  git push -u origin main
+  ```
+- **Never commit sensitive files** (e.g., `.env`, API keys, large data files).
 
 ---
 
@@ -103,6 +131,7 @@ All dependencies are pinned in `requirements.txt`. Key packages:
 - **ModuleNotFoundError: No module named 'Data'**: Make sure you run the GUI from the project root, and that the `Data` folder is present and in your Python path.
 - **pandas fillna Deprecation Warning**: The code now uses `df.ffill().bfill()` instead of the deprecated `df.fillna(method=...)`.
 - **LLM Output is Too Verbose**: The LLM prompt is now engineered to provide concise technical summaries, not trading recommendations.
+- **Not Enough Data for Training**: The minimum row count for ML training is user-configurable. If you see this error, try lowering the minimum or fetching more data.
 
 ---
 

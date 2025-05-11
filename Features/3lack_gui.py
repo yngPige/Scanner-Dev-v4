@@ -243,7 +243,12 @@ class MainWindow(QMainWindow):
                     bearish = False
                     change_pct = 0.0
                 for col_idx, value in enumerate(row_data):
-                    if col_idx == 5:
+                    if col_idx in [1, 2, 3, 4]:  # open, high, low, close
+                        try:
+                            value = f"{float(value):,.4f}"
+                        except Exception:
+                            pass
+                    elif col_idx == 5:
                         try:
                             value = f"{float(value):,.0f}"
                         except Exception:
@@ -448,7 +453,7 @@ Do NOT provide trading recommendations, entry/exit prices, or any rationale for 
             return 'green' if sent == 'BULLISH' else 'red' if sent == 'BEARISH' else 'gray'
         def fmt_price(val):
             try:
-                return f"{float(val):,.0f}"
+                return f"{float(val):,.4f}"
             except Exception:
                 return str(val)
         # Compact summary table
