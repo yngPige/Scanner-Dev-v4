@@ -111,6 +111,10 @@ class MainWindow(QMainWindow):
         self.download_button = QPushButton("Download Historical Data")
         self.download_button.clicked.connect(self.download_historical_data)
 
+        # Download All Timeframes Button
+        self.download_all_button = QPushButton("Download All Timeframes")
+        self.download_all_button.clicked.connect(self.download_all_timeframes_for_selected_pair)
+
         # Progress Bar
         self.progress_bar = QProgressBar()
         self.progress_bar.setMinimum(0)
@@ -126,6 +130,11 @@ class MainWindow(QMainWindow):
         self.current_label = QLabel("<b>Current:</b> --")
         self.current_label.setTextFormat(Qt.TextFormat.RichText)
 
+        # Data Timestamp Label
+        self.data_timestamp_label = QLabel("<b>Last Data Fetch:</b> --")
+        self.data_timestamp_label.setTextFormat(Qt.TextFormat.RichText)
+        main_layout.addWidget(self.data_timestamp_label)
+
         # Add widgets to main_layout (after creation)
         main_layout.addLayout(controls_layout)
         main_layout.addWidget(self.fetch_button)
@@ -133,11 +142,12 @@ class MainWindow(QMainWindow):
         main_layout.addWidget(self.analyze_button)
         main_layout.addWidget(self.train_button)
         main_layout.addWidget(self.download_button)
+        main_layout.addWidget(self.download_all_button)
         main_layout.addWidget(self.progress_bar)
         main_layout.addWidget(self.backtest_button)
         main_layout.addWidget(self.okx_test_button)
         main_layout.addWidget(self.current_label)
-        main_layout.addWidget(QLabel("LLM Analysis & Recommendations:"))
+        main_layout.addWidget(QLabel("Analysis & Recommendations:"))
         main_layout.addWidget(self.llm_output)
 
         # Set main widget
@@ -159,6 +169,12 @@ class MainWindow(QMainWindow):
         self.selected_exchange = "OKX"
         self.timeframe_combo.setCurrentText("1h")
         self.fetch_data()
+
+        # Timer for auto-refreshing timestamp
+        self.data_timestamp_timer = QTimer(self)
+        self.data_timestamp_timer.timeout.connect(self.refresh_data_timestamp)
+        self.data_timestamp_timer.start(5000)  # 5 seconds
+        self.last_data_fetch_time = None
 
     def update_exchange_status(self):
         """Check if OKX exchange is reachable and update the status label."""
@@ -268,6 +284,9 @@ class MainWindow(QMainWindow):
                 pct_item = QTableWidgetItem(f"{change_pct:.2f}%")
                 self.data_table.setItem(row_idx, 6, pct_item)
             self.llm_output.setText("")
+            # Update last data fetch time
+            self.last_data_fetch_time = datetime.now(timezone.utc)
+            self.refresh_data_timestamp()
         else:
             self.data_table.setRowCount(0)
             self.data_table.setVisible(False)
@@ -439,7 +458,7 @@ Do NOT provide trading recommendations, entry/exit prices, or any rationale for 
 
     def format_ml_analysis_html(self, result: dict) -> str:
         """
-        Format the ML analysis result as a comprehensive, visually clear HTML summary for display.
+        Format the ML analysis result as a comprehensive, visually clear HTML summary for display, using a structured HTML list. Exclude Direction and Price Action.
         """
         if not isinstance(result, dict):
             return f"<b>[ML Analysis]</b> Invalid result."
@@ -447,8 +466,6 @@ Do NOT provide trading recommendations, entry/exit prices, or any rationale for 
             return f"<b>[ML Analysis Error]</b> {result['error']}"
         def color_for_recommendation(rec):
             return 'green' if rec == 'BUY' else 'red' if rec == 'SELL' else 'gray'
-        def color_for_direction(dir):
-            return 'green' if dir == 'UP' else 'red' if dir == 'DOWN' else 'gray'
         def color_for_sentiment(sent):
             return 'green' if sent == 'BULLISH' else 'red' if sent == 'BEARISH' else 'gray'
         def fmt_price(val):
@@ -456,39 +473,18 @@ Do NOT provide trading recommendations, entry/exit prices, or any rationale for 
                 return f"{float(val):,.4f}"
             except Exception:
                 return str(val)
-        # Compact summary table
-        html = """
-        <table border='1' cellpadding='4' cellspacing='0' style='border-collapse:collapse;font-family:Arial,sans-serif;font-size:13px;'>
-        <tr><th>Rec</th><th>Dir</th><th>Conf</th><th>Price</th><th>Sent</th><th>PosSz</th><th>TF Suit</th></tr>
-        <tr>
-            <td style='color:{rec_color};font-weight:bold'>{rec}</td>
-            <td style='color:{dir_color};'>{direction}</td>
-            <td style='color:gold;font-weight:bold'>{conf:.2f}%</td>
-            <td style='color:gold;font-weight:bold'>{price}</td>
-            <td style='color:{sent_color};'>{sentiment}</td>
-            <td>{pos_size:.2f}%</td>
-            <td>{tf_suit}</td>
-        </tr>
-        </table>
-        """.format(
-            rec=result.get('recommendation', ''),
-            rec_color=color_for_recommendation(result.get('recommendation')),
-            direction=result.get('direction', ''),
-            dir_color=color_for_direction(result.get('direction')),
-            conf=result.get('confidence', 0),
-            price=fmt_price(result.get('current_price', 'N/A')),
-            sentiment=result.get('metrics', {}).get('market_sentiment', 'N/A'),
-            sent_color=color_for_sentiment(result.get('metrics', {}).get('market_sentiment', '')),
-            pos_size=result.get('metrics', {}).get('position_size_recommendation', 0),
-            tf_suit=result.get('metrics', {}).get('timeframe_suitability', 'N/A')
-        )
+        html = "<ul style='font-family:Arial,sans-serif;font-size:13px;'>"
+        html += f"<li><b>Recommendation:</b> <span style='color:{color_for_recommendation(result.get('recommendation'))};font-weight:bold'>{result.get('recommendation','')}</span></li>"
+        html += f"<li><b>Confidence:</b> <span style='color:gold;font-weight:bold'>{result.get('confidence',0):.2f}%</span></li>"
+        html += f"<li><b>Current Price:</b> <span style='color:gold;font-weight:bold'>{fmt_price(result.get('current_price','N/A'))}</span></li>"
+        html += f"<li><b>Sentiment:</b> <span style='color:{color_for_sentiment(result.get('metrics',{}).get('market_sentiment',''))};'>{result.get('metrics',{}).get('market_sentiment','N/A')}</span></li>"
+        html += f"<li><b>Position Size:</b> {result.get('metrics',{}).get('position_size_recommendation',0):.2f}%</li>"
+        html += f"<li><b>Timeframe Suitability:</b> {result.get('metrics',{}).get('timeframe_suitability','N/A')}</li>"
         # Support/Resistance
         support_levels = ', '.join(fmt_price(s) for s in result.get('support_levels', []))
         resistance_levels = ', '.join(fmt_price(r) for r in result.get('resistance_levels', []))
-        html += f"<b>Support:</b> {support_levels} &nbsp; <b>Resistance:</b> {resistance_levels}<br>"
-        # Price Action
-        if result.get('price_action_summary'):
-            html += f"<b>Price Action:</b> {result.get('price_action_summary')}<br>"
+        html += f"<li><b>Support Levels:</b> {support_levels}</li>"
+        html += f"<li><b>Resistance Levels:</b> {resistance_levels}</li>"
         # Limit Orders (condensed)
         lo = result.get('limit_orders', {})
         if lo:
@@ -500,7 +496,11 @@ Do NOT provide trading recommendations, entry/exit prices, or any rationale for 
                         continue
                     orders.append(f"{order_type.title()}: {o.get('type','')} @ {fmt_price(o.get('price',''))} ({confidence})")
             if orders:
-                html += "<b>Orders:</b> " + "; ".join(orders) + "<br>"
+                html += "<li><b>Orders:</b><ul>"
+                for order in orders:
+                    html += f"<li>{order}</li>"
+                html += "</ul></li>"
+        html += "</ul>"
         return html
 
     def add_technical_indicators(self, df: pd.DataFrame, min_rows: int = 35) -> pd.DataFrame:
@@ -605,40 +605,50 @@ Do NOT provide trading recommendations, entry/exit prices, or any rationale for 
         if not ok:
             self.llm_output.append("<b>[ML Training]</b> Training cancelled by user (min rows dialog).")
             return
-        confirm = QMessageBox.question(
-            self,
-            "Download Historical Data",
-            f"Do you want to download the last {rows} rows of historical data for {symbol} ({timeframe}) before training?",
-            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
-        )
-        if confirm != QMessageBox.StandardButton.Yes:
-            self.llm_output.append("<b>[ML Training]</b> Training cancelled by user.")
-            return
-        self.progress_bar.setVisible(True)
-        self.progress_bar.setValue(0)
-        self.progress_bar.setFormat("Downloading historical data... %p%")
-        QApplication.processEvents()
-        chunk_size = min(200, rows)
-        all_ohlcv = []
-        for start in range(0, rows, chunk_size):
-            limit = min(chunk_size, rows - start)
-            ohlcv = fetch_okx_ohlcv(symbol, fetch_tf, limit=limit)
-            if not ohlcv:
-                self.progress_bar.setVisible(False)
-                QMessageBox.critical(self, "Download Failed", f"Failed to download historical data for {symbol} ({timeframe}). Training cancelled.")
-                self.llm_output.append("<b>[ML Training]</b> Download failed. Training cancelled.")
-                return
-            all_ohlcv.extend(ohlcv)
-            pct = int(100 * (start + limit) / rows)
-            self.progress_bar.setValue(min(pct, 100))
-            QApplication.processEvents()
-        save_ohlcv(symbol, timeframe, all_ohlcv)
-        self.progress_bar.setVisible(False)
-        self.llm_output.append(f"<b>[ML Training]</b> Downloaded {len(all_ohlcv)} rows for {symbol} ({timeframe}). Starting training...")
-        QApplication.processEvents()
+        # Check if data already exists and is sufficient
         df_hist = load_ohlcv(symbol, timeframe)
         if not df_hist.empty:
             df_hist = df_hist.rename(columns={col: col.lower() for col in df_hist.columns})
+        valid_rows = len(df_hist.dropna(subset=["open", "high", "low", "close", "volume"])) if not df_hist.empty else 0
+        if valid_rows >= min_rows:
+            self.llm_output.append(f"<b>[ML Training]</b> Using existing data for {symbol} ({timeframe}). Valid rows: {valid_rows}")
+        else:
+            confirm = QMessageBox.question(
+                self,
+                "Download Historical Data",
+                f"Do you want to download the last {rows} rows of historical data for {symbol} ({timeframe}) before training?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
+            )
+            if confirm != QMessageBox.StandardButton.Yes:
+                self.llm_output.append("<b>[ML Training]</b> Training cancelled by user.")
+                return
+            self.progress_bar.setVisible(True)
+            self.progress_bar.setValue(0)
+            self.progress_bar.setFormat("Downloading historical data... %p%")
+            QApplication.processEvents()
+            chunk_size = min(200, rows)
+            all_ohlcv = []
+            from Data.okx_public_data import fetch_okx_ohlcv
+            for start in range(0, rows, chunk_size):
+                limit = min(chunk_size, rows - start)
+                ohlcv = fetch_okx_ohlcv(symbol, fetch_tf, limit=limit)
+                if not ohlcv:
+                    self.progress_bar.setVisible(False)
+                    QMessageBox.critical(self, "Download Failed", f"Failed to download historical data for {symbol} ({timeframe}). Training cancelled.")
+                    self.llm_output.append("<b>[ML Training]</b> Download failed. Training cancelled.")
+                    return
+                all_ohlcv.extend(ohlcv)
+                pct = int(100 * (start + limit) / rows)
+                self.progress_bar.setValue(min(pct, 100))
+                QApplication.processEvents()
+            from src.utils.data_storage import save_ohlcv
+            save_ohlcv(symbol, timeframe, all_ohlcv)
+            self.progress_bar.setVisible(False)
+            self.llm_output.append(f"<b>[ML Training]</b> Downloaded {len(all_ohlcv)} rows for {symbol} ({timeframe}). Starting training...")
+            QApplication.processEvents()
+            df_hist = load_ohlcv(symbol, timeframe)
+            if not df_hist.empty:
+                df_hist = df_hist.rename(columns={col: col.lower() for col in df_hist.columns})
         if df_hist.empty:
             self.llm_output.setHtml("<b>[ML Training]</b> No historical data available for this symbol/timeframe.")
             return
@@ -995,6 +1005,45 @@ Do NOT provide trading recommendations, entry/exit prices, or any rationale for 
         self.data_table.setVisible(True)
         # Automatically fetch data for the selected pair
         self.fetch_data()
+
+    def download_all_timeframes_for_selected_pair(self):
+        """
+        Download OHLCV data for all supported timeframes for the selected pair.
+        """
+        pair = self.select_pair_button.text().strip().upper()
+        if not pair or pair == "SELECT PAIR":
+            self.llm_output.append("<b>[Download]</b> Please select a pair first.")
+            return
+        timeframes = ["5m", "15m", "30m", "1h", "4h", "1d"]
+        limits = {"5m": 3000, "15m": 2000, "30m": 1500, "1h": 1000, "4h": 600, "1d": 200}
+        self.progress_bar.setVisible(True)
+        self.progress_bar.setMaximum(len(timeframes))
+        self.progress_bar.setValue(0)
+        self.progress_bar.setFormat("Downloading all timeframes... %p%")
+        QApplication.processEvents()
+        from Data.okx_public_data import fetch_okx_ohlcv
+        from src.utils.data_storage import save_ohlcv
+        for i, tf in enumerate(timeframes):
+            limit = limits.get(tf, 100)
+            self.llm_output.append(f"<b>[Download]</b> Downloading {limit} rows for {pair} ({tf})...")
+            QApplication.processEvents()
+            ohlcv = fetch_okx_ohlcv(pair, tf, limit=limit)
+            if ohlcv:
+                save_ohlcv(pair, tf, ohlcv)
+                self.llm_output.append(f"<b>[Download]</b> Saved {len(ohlcv)} rows for {pair} ({tf})")
+            else:
+                self.llm_output.append(f"<b>[Download]</b> Failed to fetch data for {pair} ({tf})")
+            self.progress_bar.setValue(i + 1)
+            QApplication.processEvents()
+        self.progress_bar.setVisible(False)
+        self.llm_output.append(f"<b>[Download]</b> All timeframes downloaded for {pair}.")
+
+    def refresh_data_timestamp(self):
+        if self.last_data_fetch_time:
+            ts_str = self.last_data_fetch_time.strftime('%Y-%m-%d %H:%M:%S UTC')
+            self.data_timestamp_label.setText(f"<b>Last Data Fetch:</b> {ts_str}")
+        else:
+            self.data_timestamp_label.setText("<b>Last Data Fetch:</b> --")
 
 def call_ollama_llm(prompt: str, model: str = "llama2", temperature: float = 0.2, max_tokens: int = 512) -> str:
     """
