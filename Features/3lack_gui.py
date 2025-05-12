@@ -22,6 +22,11 @@ import pandas as pd
 from src.utils.data_storage import save_ohlcv, load_ohlcv
 import pandas_ta as ta
 import numpy as np
+from dotenv import load_dotenv
+import os
+from Data.blofin_oublic_data import BlofinWebSocketClient, fetch_blofin_instruments, get_blofin_spot_pairs_via_ws
+
+load_dotenv()
 
 class MainWindow(QMainWindow):
     def __init__(self):
@@ -31,6 +36,7 @@ class MainWindow(QMainWindow):
         self.setGeometry(100, 100, 900, 700)
         self.selected_algorithm = "RandomForest"  # Default
         self.ml_analyzer = MLAnalyzer()
+        self.pair_sources = {}  # Ensure pair_sources is always initialized
         self.init_ui()
 
     def init_ui(self):
@@ -103,9 +109,9 @@ class MainWindow(QMainWindow):
         self.llm_output = QTextEdit()
         self.llm_output.setReadOnly(True)
 
-        # OKX API Test Button
-        self.okx_test_button = QPushButton("Test OKX API")
-        self.okx_test_button.clicked.connect(self.run_okx_api_test)
+        # Test API Button (was OKX API Test Button)
+        self.test_api_button = QPushButton("Test API")
+        self.test_api_button.clicked.connect(self.run_api_test)
 
         # Download Button
         self.download_button = QPushButton("Download Historical Data")
@@ -145,7 +151,7 @@ class MainWindow(QMainWindow):
         main_layout.addWidget(self.download_all_button)
         main_layout.addWidget(self.progress_bar)
         main_layout.addWidget(self.backtest_button)
-        main_layout.addWidget(self.okx_test_button)
+        main_layout.addWidget(self.test_api_button)
         main_layout.addWidget(self.current_label)
         main_layout.addWidget(QLabel("Analysis & Recommendations:"))
         main_layout.addWidget(self.llm_output)
@@ -232,7 +238,10 @@ class MainWindow(QMainWindow):
             limit = timeframe_limits.get(timeframe, 100)
         ohlcv = None
         if hasattr(self, 'selected_exchange') and self.selected_exchange == "Blofin":
-            ohlcv = self.fetch_blofin_ohlcv(symbol, fetch_tf, limit)
+            # Use WebSocket for Blofin OHLCV
+            inst_id = symbol.replace("/", "-") + "-SPOT" if not symbol.endswith("-SPOT") else symbol
+            ws_client = BlofinWebSocketClient()
+            ohlcv = ws_client.fetch_ohlcv(inst_id, bar=fetch_tf, limit=limit, timeout=5.0)
         else:
             from Data.okx_public_data import fetch_okx_ohlcv
             ohlcv = fetch_okx_ohlcv(symbol, fetch_tf, limit=limit)
@@ -291,28 +300,6 @@ class MainWindow(QMainWindow):
             self.data_table.setRowCount(0)
             self.data_table.setVisible(False)
             self.llm_output.setText("Failed to fetch OHLCV data. Please check the symbol, timeframe, or your internet connection.")
-
-    def fetch_blofin_ohlcv(self, symbol: str, timeframe: str, limit: int):
-        # Map timeframe to Blofin format if needed
-        tf_map = {"1m": "1min", "5m": "5min", "15m": "15min", "30m": "30min", "1h": "1hour", "4h": "4hour", "1d": "1day"}
-        tf = tf_map.get(timeframe, timeframe)
-        symbol_blofin = symbol.replace("/", "")
-        url = f"https://api.blofin.com/api/v1/public/kline?symbol={symbol_blofin}&interval={tf}&limit={limit}"
-        try:
-            resp = requests.get(url, timeout=10)
-            resp.raise_for_status()
-            data = resp.json()
-            if data.get('data'):
-                # Blofin returns: [ [timestamp, open, high, low, close, volume, ...], ... ]
-                ohlcv = []
-                for row in data['data']:
-                    ts = int(row[0])
-                    o, h, l, c, vol = map(float, row[1:6])
-                    ohlcv.append([ts, o, h, l, c, vol])
-                return ohlcv
-            return None
-        except Exception as e:
-            return None
 
     def run_analysis(self):
         """Run analysis using MLAnalyzer only."""
@@ -421,31 +408,18 @@ Do NOT provide trading recommendations, entry/exit prices, or any rationale for 
         self.llm_output.setHtml(f"<b>LLM ({ollama_model}) Technical Summary:</b><br>{llm_response}")
         return llm_response
 
-    def run_okx_api_test(self):
+    def run_api_test(self):
+        """Test OKX and Blofin API endpoints and display results in the LLM output box."""
+        from Data.okx_public_data import test_api
+        import pprint
         self.update_exchange_status()
-        """Test OKX server time endpoint and display results in the LLM output box."""
-        url = "https://www.okx.com/api/v5/public/time"
-        output = [f"Testing URL: {url}"]
-        try:
-            start_time = time.time()
-            response = requests.get(url, timeout=10)
-            end_time = time.time()
-            response_time = (end_time - start_time) * 1000  # ms
-            output.append(f"Response time: {response_time:.2f} ms")
-            output.append(f"Status code: {response.status_code}")
-            if response.status_code == 200:
-                try:
-                    result = response.json()
-                    output.append(f"Response: {json.dumps(result, indent=2)}")
-                except json.JSONDecodeError as e:
-                    output.append(f"Error decoding JSON: {e}")
-                    output.append(f"Raw response: {response.text}")
-            else:
-                output.append(f"Error: {response.status_code} - {response.text}")
-        except Exception as e:
-            output.append(f"Exception: {e}")
-        output.append("\n=== Test Complete ===")
-        self.llm_output.setText("\n".join(output))
+        result = test_api()
+        html = "<b>API Connectivity Test Results</b><br>"
+        for ex, ex_result in result.items():
+            html += f"<b>{ex.upper()}:</b> Status: {ex_result['status']}<br>"
+            for k, v in ex_result['details'].items():
+                html += f"&nbsp;&nbsp;<b>{k}:</b> {pprint.pformat(v)}<br>"
+        self.llm_output.setHtml(html)
 
     def ohlcv_to_df(self, ohlcv_data):
         # ohlcv_data: List[List[str]] (from table)
@@ -917,6 +891,7 @@ Do NOT provide trading recommendations, entry/exit prices, or any rationale for 
 
     def show_pair_menu(self):
         from Data.okx_public_data import fetch_okx_ticker
+        from Data.blofin_oublic_data import fetch_blofin_instruments, get_blofin_spot_pairs_via_ws
         # Hide the data table
         self.data_table.setVisible(False)
         # Create the pair menu widget
@@ -942,24 +917,28 @@ Do NOT provide trading recommendations, entry/exit prices, or any rationale for 
             )
         except Exception as e:
             okx_pairs = set([f"Error loading OKX pairs: {e}"])
-        # Fetch Blofin pairs
-        def fetch_blofin_usdt_pairs():
-            url = "https://api.blofin.com/api/v1/public/symbols"
+        # Fetch Blofin pairs via WebSocket (preferred)
+        try:
+            blofin_pairs = get_blofin_spot_pairs_via_ws(timeout=5)
+        except Exception as e:
+            blofin_pairs = set([f"Error loading Blofin pairs via WebSocket: {e}"])
+        # If WebSocket fails, try REST as fallback
+        if not blofin_pairs:
             try:
-                resp = requests.get(url, timeout=10)
-                resp.raise_for_status()
-                data = resp.json()
-                pairs = []
-                for symbol in data.get("data", []):
-                    if symbol.get("quoteCurrency") == "USDT":
-                        base = symbol.get("baseCurrency")
-                        quote = symbol.get("quoteCurrency")
+                import os
+                api_key = os.environ.get("BLOFIN_API_KEY")
+                secret = os.environ.get("BLOFIN_SECRET")
+                passphrase = os.environ.get("BLOFIN_PASSPHRASE")
+                instruments = fetch_blofin_instruments(api_key, secret, passphrase)
+                blofin_pairs = set()
+                for inst in instruments or []:
+                    if inst.get("quoteCcy", "") == "USDT":
+                        base = inst.get("baseCcy")
+                        quote = inst.get("quoteCcy")
                         if base and quote:
-                            pairs.append(f"{base}/USDT")
-                return set(pairs)
+                            blofin_pairs.add(f"{base}/USDT")
             except Exception as e:
-                return set([f"Error loading Blofin pairs: {e}"])
-        blofin_pairs = fetch_blofin_usdt_pairs()
+                blofin_pairs = set([f"Error loading Blofin pairs: {e}"])
         # Merge and mark source
         all_pairs = sorted(okx_pairs | blofin_pairs)
         self.pair_sources = {}
@@ -1008,35 +987,59 @@ Do NOT provide trading recommendations, entry/exit prices, or any rationale for 
 
     def download_all_timeframes_for_selected_pair(self):
         """
-        Download OHLCV data for all supported timeframes for the selected pair.
+        Download OHLCV data for all supported timeframes for the selected pair from both OKX (REST) and Blofin (WebSocket), if available.
+        For Blofin, fetch and store all timeframes from '5m' to '1d'.
         """
+        from Data.okx_public_data import fetch_okx_ohlcv
+        from Data.blofin_oublic_data import BlofinWebSocketClient
+        from src.utils.data_storage import save_ohlcv
         pair = self.select_pair_button.text().strip().upper()
         if not pair or pair == "SELECT PAIR":
             self.llm_output.append("<b>[Download]</b> Please select a pair first.")
             return
-        timeframes = ["5m", "15m", "30m", "1h", "4h", "1d"]
-        limits = {"5m": 3000, "15m": 2000, "30m": 1500, "1h": 1000, "4h": 600, "1d": 200}
+        okx_timeframes = ["5m", "15m", "30m", "1h", "4h", "1D"]
+        blofin_timeframes = ["5m", "15m", "30m", "1h", "4h", "1d"]
+        limits = {"5m": 3000, "15m": 2000, "30m": 1500, "1h": 1000, "4h": 600, "1D": 200, "1d": 200}
         self.progress_bar.setVisible(True)
-        self.progress_bar.setMaximum(len(timeframes))
+        self.progress_bar.setMaximum(len(okx_timeframes) + len(blofin_timeframes))
         self.progress_bar.setValue(0)
-        self.progress_bar.setFormat("Downloading all timeframes... %p%")
+        self.progress_bar.setFormat("Downloading all timeframes (OKX & Blofin)... %p%")
         QApplication.processEvents()
-        from Data.okx_public_data import fetch_okx_ohlcv
-        from src.utils.data_storage import save_ohlcv
-        for i, tf in enumerate(timeframes):
-            limit = limits.get(tf, 100)
-            self.llm_output.append(f"<b>[Download]</b> Downloading {limit} rows for {pair} ({tf})...")
-            QApplication.processEvents()
-            ohlcv = fetch_okx_ohlcv(pair, tf, limit=limit)
-            if ohlcv:
-                save_ohlcv(pair, tf, ohlcv)
-                self.llm_output.append(f"<b>[Download]</b> Saved {len(ohlcv)} rows for {pair} ({tf})")
-            else:
-                self.llm_output.append(f"<b>[Download]</b> Failed to fetch data for {pair} ({tf})")
-            self.progress_bar.setValue(i + 1)
-            QApplication.processEvents()
+        # Ensure pair_sources is initialized
+        if not hasattr(self, 'pair_sources'):
+            self.pair_sources = {}
+        # Download from OKX if supported
+        if "OKX" in self.pair_sources.get(pair, []):
+            for tf in okx_timeframes:
+                limit = limits.get(tf, 100)
+                self.llm_output.append(f"<b>[Download]</b> Downloading {limit} rows for {pair} ({tf}) from OKX...")
+                QApplication.processEvents()
+                ohlcv = fetch_okx_ohlcv(pair, tf, limit=limit)
+                if ohlcv:
+                    save_ohlcv(pair, tf, ohlcv)
+                    self.llm_output.append(f"<b>[Download]</b> Saved {len(ohlcv)} rows for {pair} ({tf}) [OKX]")
+                else:
+                    self.llm_output.append(f"<b>[Download]</b> Failed to fetch data for {pair} ({tf}) [OKX]")
+                self.progress_bar.setValue(self.progress_bar.value() + 1)
+                QApplication.processEvents()
+        # Download from Blofin WebSocket if supported
+        if "Blofin" in self.pair_sources.get(pair, []):
+            inst_id = pair.replace("/", "-") + "-SPOT" if not pair.endswith("-SPOT") else pair
+            ws_client = BlofinWebSocketClient()
+            for tf in blofin_timeframes:
+                limit = limits.get(tf, 100)
+                self.llm_output.append(f"<b>[Download]</b> Downloading {limit} rows for {pair} ({tf}) via Blofin WebSocket...")
+                QApplication.processEvents()
+                ohlcv = ws_client.fetch_ohlcv(inst_id, bar=tf, limit=limit, timeout=5.0)
+                if ohlcv:
+                    save_ohlcv(pair, tf, ohlcv)
+                    self.llm_output.append(f"<b>[Download]</b> Saved {len(ohlcv)} rows for {pair} ({tf}) [Blofin]")
+                else:
+                    self.llm_output.append(f"<b>[Download]</b> Failed to fetch data for {pair} ({tf}) [Blofin]")
+                self.progress_bar.setValue(self.progress_bar.value() + 1)
+                QApplication.processEvents()
         self.progress_bar.setVisible(False)
-        self.llm_output.append(f"<b>[Download]</b> All timeframes downloaded for {pair}.")
+        self.llm_output.append(f"<b>[Download]</b> All timeframes downloaded for {pair} (OKX & Blofin).")
 
     def refresh_data_timestamp(self):
         if self.last_data_fetch_time:

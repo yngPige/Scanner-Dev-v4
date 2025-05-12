@@ -2,35 +2,63 @@ import logging
 from typing import Any, Dict, List, Optional
 import requests
 import os
+from dotenv import load_dotenv
+
+
+load_dotenv()  # Loads variables from .env into os.environ
+
+api_key = os.environ.get("BLOFIN_API_KEY")
+secret = os.environ.get("BLOFIN_SECRET")
+passphrase = os.environ.get("BLOFIN_PASSPHRASE")
 
 logger = logging.getLogger(__name__)
 
 
-def test_okx_api() -> Dict[str, Any]:
-    """Test OKX API connectivity and basic public endpoint functionality.
+def test_api() -> Dict[str, Any]:
+    """Test OKX and Blofin API connectivity and basic public endpoint functionality, including Blofin WebSocket.
 
     Returns:
         Dict[str, Any]: Dictionary with status and details of the API test.
 
     Example:
-        >>> test_okx_api()
+        >>> test_api()
     """
-    result = {"status": "success", "details": {}}
+    result = {"okx": {"status": "success", "details": {}}, "blofin": {"status": "success", "details": {}}}
+    # OKX Test
     try:
-        # Test fetching markets using direct API call
         markets_url = "https://www.okx.com/api/v5/public/instruments?instType=SPOT"
         markets_resp = requests.get(markets_url, timeout=10)
         markets_resp.raise_for_status()
         markets_data = markets_resp.json()
-        result["details"]["markets_count"] = len(markets_data.get('data', []))
-        
-        # Test fetching ticker for BTC/USDT
+        result["okx"]["details"]["markets_count"] = len(markets_data.get('data', []))
         ticker = fetch_okx_ticker('BTC/USDT')
-        result["details"]["ticker"] = ticker.get('lastPx') if ticker else None
+        result["okx"]["details"]["ticker"] = ticker.get('lastPx') if ticker else None
     except Exception as exc:
         logger.error(f"OKX API test failed: {exc}")
-        result["status"] = "error"
-        result["details"]["error"] = str(exc)
+        result["okx"]["status"] = "error"
+        result["okx"]["details"]["error"] = str(exc)
+    # Blofin Test
+    try:
+        from Data.blofin_oublic_data import fetch_blofin_instruments, fetch_blofin_ticker, BlofinWebSocketClient
+        api_key = os.environ.get("BLOFIN_API_KEY")
+        secret = os.environ.get("BLOFIN_SECRET")
+        passphrase = os.environ.get("BLOFIN_PASSPHRASE")
+        instruments = fetch_blofin_instruments(api_key, secret, passphrase)
+        result["blofin"]["details"]["markets_count"] = len(instruments) if instruments else 0
+        # If fetch_blofin_ticker requires auth, pass credentials
+        try:
+            ticker = fetch_blofin_ticker(api_key, secret, passphrase, 'BTC-USDT-SPOT')
+        except TypeError:
+            ticker = fetch_blofin_ticker('BTC-USDT-SPOT')
+        result["blofin"]["details"]["ticker"] = ticker.get('last') if ticker else None
+        # Test Blofin WebSocket OHLCV
+        ws_client = BlofinWebSocketClient()
+        ws_ohlcv = ws_client.fetch_ohlcv('BTC-USDT-SPOT', bar='1m', limit=5, timeout=5.0)
+        result["blofin"]["details"]["websocket_ohlcv_sample"] = ws_ohlcv[:2] if ws_ohlcv else []
+    except Exception as exc:
+        logger.error(f"Blofin API test failed: {exc}")
+        result["blofin"]["status"] = "error"
+        result["blofin"]["details"]["error"] = str(exc)
     return result
 
 
@@ -117,7 +145,7 @@ if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO)
     # Example usage
     print("OKX API Test:")
-    pprint.pprint(test_okx_api())
+    pprint.pprint(test_api())
     print("\nOKX Ticker:")
     pprint.pprint(fetch_okx_ticker('BTC/USDT'))
     print("\nOKX OHLCV:")

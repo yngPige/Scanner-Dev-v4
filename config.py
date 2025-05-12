@@ -2,6 +2,15 @@
 Configuration for MLAnalyzer and trading parameters.
 """
 from typing import Dict, Any
+import os
+from dotenv import load_dotenv
+from Data.blofin_oublic_data import fetch_blofin_instruments
+load_dotenv()  # This loads variables from .env into os.environ
+
+api_key = os.environ.get("BLOFIN_API_KEY")
+secret = os.environ.get("BLOFIN_SECRET")
+passphrase = os.environ.get("BLOFIN_PASSPHRASE")
+markets = fetch_blofin_instruments(api_key, secret, passphrase)
 
 # ML Algorithm selection
 ML_ALGORITHM: str = "RandomForest"  # Options: "RandomForest", "GradientBoosting", "SVM"
@@ -31,4 +40,4 @@ RF_PARAM_GRID: Dict[str, Any] = {
 STOP_LOSS_PERCENTAGE: float = 0.02  # 2% stop loss
 TAKE_PROFIT_PERCENTAGE: float = 0.04  # 4% take profit
 
-# Add more config as needed for other algorithms or features 
+# Add more config as needed for other algorithms or features from dotenv import load_dotenv
