@@ -17,7 +17,7 @@ from PyQt6.QtGui import QIcon
 from datetime import datetime, timezone
 from Data.okx_public_data import fetch_okx_ticker, fetch_okx_ohlcv
 import requests
-from src.analysis.ml import MLAnalyzer
+from src.analysis.ml import MLAnalyzer, launch_optuna_dashboard
 import pandas as pd
 from src.utils.data_storage import save_ohlcv, load_ohlcv
 import pandas_ta as ta
@@ -25,6 +25,7 @@ import numpy as np
 from dotenv import load_dotenv
 import os
 from Data.blofin_oublic_data import BlofinWebSocketClient, fetch_blofin_instruments, get_blofin_spot_pairs_via_ws
+from backtest_strategies.strategies import moving_average_crossover_strategy, rsi_strategy, buy_and_hold_strategy
 
 load_dotenv()
 
@@ -38,6 +39,76 @@ class MainWindow(QMainWindow):
         self.ml_analyzer = MLAnalyzer()
         self.pair_sources = {}  # Ensure pair_sources is always initialized
         self.init_ui()
+        # Add dynamic suggestion label
+        self.row_suggestion_label = QLabel()
+        self.row_suggestion_label.setText("")
+        self.row_suggestion_label.setStyleSheet("font-size:12px;")
+        self.centralWidget().layout().insertWidget(1, self.row_suggestion_label)
+        # Connect signals for dynamic update
+        self.timeframe_combo.currentTextChanged.connect(self.update_row_suggestion)
+        self.algorithm_combo.currentTextChanged.connect(self.update_row_suggestion)
+
+    def update_row_suggestion(self):
+        timeframe = self.timeframe_combo.currentText()
+        algorithm = self.algorithm_combo.currentText()
+        rows = self.rows_spinbox.value()
+        # Heuristic: higher frequency needs more rows
+        tf_rows = {
+            "5m": 2000,
+            "15m": 1500,
+            "30m": 1000,
+            "1h": 800,
+            "4h": 500,
+            "1d": 300,
+            "1w": 100,
+            "1m": 2000,
+            "3m": 1500,
+            "1M": 50,
+        }
+        algo_factor = {
+            "RandomForest": 1.0,
+            "GradientBoosting": 1.2,
+            "SVM": 1.5,
+            "XGBoost": 1.2,
+        }
+        min_rows = int(tf_rows.get(timeframe, 500) * algo_factor.get(algorithm, 1.0))
+        # Check available rows if possible
+        custom = self.select_pair_button.text().strip().upper()
+        symbol = f"{custom}/USDT" if custom else None
+        tf_map = {
+            "5m": "5m",
+            "15m": "15m",
+            "30m": "30m",
+            "1h": "1H",
+            "4h": "4H",
+            "1d": "1D",
+            "1w": "1W",
+            "1m": "1m",
+            "3m": "3m",
+            "1M": "1M",
+        }
+        fetch_tf = tf_map.get(timeframe, timeframe)
+        available = 0
+        if symbol:
+            try:
+                df = load_ohlcv(symbol, fetch_tf)
+                available = len(df.dropna(subset=["open", "high", "low", "close", "volume"]))
+            except Exception:
+                available = 0
+        # Color code
+        if available == 0:
+            color = "gray"
+            msg = f"Recommended: <b>{min_rows}</b> rows for {algorithm} ({timeframe}). Rows to download: <b>{rows}</b>."
+        elif available < min_rows:
+            color = "red"
+            msg = f"<b>Warning:</b> Only {available} rows available. Recommended: <b>{min_rows}</b>+ rows for {algorithm} ({timeframe}). Rows to download: <b>{rows}</b>."
+        elif available < min_rows * 1.2:
+            color = "orange"
+            msg = f"<b>Borderline:</b> {available} rows available. Recommended: <b>{min_rows}</b>+ rows for {algorithm} ({timeframe}). Rows to download: <b>{rows}</b>."
+        else:
+            color = "green"
+            msg = f"{available} rows available. Recommended: <b>{min_rows}</b>+ rows for {algorithm} ({timeframe}). Rows to download: <b>{rows}</b>."
+        self.row_suggestion_label.setText(f"<span style='color:{color};'>{msg}</span>")
 
     def init_ui(self):
         # Layouts
@@ -55,6 +126,20 @@ class MainWindow(QMainWindow):
         self.timeframe_combo.addItems(["5m", "15m", "30m", "1h", "4h", "1d", "30d"])
         controls_layout.addWidget(QLabel("Timeframe:"))
         controls_layout.addWidget(self.timeframe_combo)
+
+        # Rows to Download
+        self.rows_spinbox = QSpinBox()
+        self.rows_spinbox.setRange(50, 10000)
+        self.rows_spinbox.setValue(1000)
+        self.rows_spinbox.setSingleStep(50)
+        controls_layout.addWidget(QLabel("Rows:"))
+        controls_layout.addWidget(self.rows_spinbox)
+        self.rows_spinbox.valueChanged.connect(self.update_row_suggestion)
+        # Add Set Rows confirmation button
+        self.set_rows_button = QPushButton("Set Rows")
+        self.set_rows_button.setCheckable(True)
+        self.set_rows_button.clicked.connect(self.toggle_rows_edit)
+        controls_layout.addWidget(self.set_rows_button)
 
         # ML Algorithm Selector
         self.algorithm_combo = QComboBox()
@@ -128,9 +213,24 @@ class MainWindow(QMainWindow):
         self.progress_bar.setValue(0)
         self.progress_bar.setVisible(False)
 
+        # Strategy Selector
+        self.strategy_combo = QComboBox()
+        self.strategy_combo.addItems([
+            "ML Model",
+            "Moving Average Crossover",
+            "RSI",
+            "Buy & Hold"
+        ])
+        controls_layout.addWidget(QLabel("Backtest Strategy:"))
+        controls_layout.addWidget(self.strategy_combo)
+
         # Backtest Button
         self.backtest_button = QPushButton("Backtest")
         self.backtest_button.clicked.connect(self.run_backtest)
+
+        # Add Optuna Dashboard Button
+        self.optuna_dashboard_button = QPushButton("Optuna Dashboard")
+        self.optuna_dashboard_button.clicked.connect(self.run_optuna_dashboard)
 
         # Add Current section for real-time data
         self.current_label = QLabel("<b>Current:</b> --")
@@ -151,6 +251,7 @@ class MainWindow(QMainWindow):
         main_layout.addWidget(self.download_all_button)
         main_layout.addWidget(self.progress_bar)
         main_layout.addWidget(self.backtest_button)
+        main_layout.addWidget(self.optuna_dashboard_button)
         main_layout.addWidget(self.test_api_button)
         main_layout.addWidget(self.current_label)
         main_layout.addWidget(QLabel("Analysis & Recommendations:"))
@@ -205,6 +306,7 @@ class MainWindow(QMainWindow):
             self.llm_output.setText("Please select a pair.")
             return
         timeframe = self.timeframe_combo.currentText()
+        rows = self.rows_spinbox.value()
         # Map UI timeframes to OKX valid bars
         tf_map = {
             "5m": "5m",
@@ -223,19 +325,7 @@ class MainWindow(QMainWindow):
             limit = 30
         else:
             fetch_tf = tf_map.get(timeframe, timeframe)
-            timeframe_limits = {
-                "5m": 3000,
-                "15m": 2000,
-                "30m": 1500,
-                "1h": 1000,
-                "4h": 600,
-                "1d": 200,
-                "1w": 52,
-                "1m": 1440,
-                "3m": 480,
-                "1M": 12,
-            }
-            limit = timeframe_limits.get(timeframe, 100)
+            limit = rows
         ohlcv = None
         if hasattr(self, 'selected_exchange') and self.selected_exchange == "Blofin":
             # Use WebSocket for Blofin OHLCV
@@ -534,8 +624,18 @@ Do NOT provide trading recommendations, entry/exit prices, or any rationale for 
             raise ValueError(f"Not enough valid data for indicator calculation. At least {min_rows} rows are required after cleaning. Valid rows: {valid_rows}")
         return df
 
+    def toggle_rows_edit(self):
+        if self.set_rows_button.isChecked():
+            self.rows_spinbox.setDisabled(True)
+            self.set_rows_button.setText("Edit Rows")
+            self.llm_output.append(f"Rows set to <b>{self.rows_spinbox.value()}</b>. To change, click 'Edit Rows'.")
+        else:
+            self.rows_spinbox.setDisabled(False)
+            self.set_rows_button.setText("Set Rows")
+            self.llm_output.append("You can now edit the number of rows.")
+
     def train_model(self):
-        """Prompt for 30-day data download, show progress bar, and train model using MLAnalyzer only."""
+        self.update_row_suggestion()
         custom = self.select_pair_button.text().strip().upper()
         if custom:
             symbol = f"{custom}/USDT"
@@ -543,7 +643,7 @@ Do NOT provide trading recommendations, entry/exit prices, or any rationale for 
             self.llm_output.append("<b>[ML Training]</b> Please enter a symbol (e.g., BTC) in the Pair field.")
             return
         timeframe = self.timeframe_combo.currentText()
-        # Map UI timeframes to OKX valid bars
+        rows = self.rows_spinbox.value()
         tf_map = {
             "5m": "5m",
             "15m": "15m",
@@ -556,85 +656,22 @@ Do NOT provide trading recommendations, entry/exit prices, or any rationale for 
             "3m": "3m",
             "1M": "1M",
         }
-        if timeframe == "30d":
-            fetch_tf = "1D"
-            rows = 30
-        else:
-            fetch_tf = tf_map.get(timeframe, timeframe)
-            timeframe_limits = {
-                "5m": 3000,
-                "15m": 2000,
-                "30m": 1500,
-                "1h": 1000,
-                "4h": 600,
-                "1d": 200,
-                "1w": 52,
-                "1m": 1440,
-                "3m": 480,
-                "1M": 12,
-            }
-            rows = timeframe_limits.get(timeframe, 100)
-        # Prompt for minimum rows
-        min_rows, ok = QInputDialog.getInt(self, "Minimum Rows Required", "Enter minimum number of valid rows for training:", 35, 10, 500, 1)
-        if not ok:
-            self.llm_output.append("<b>[ML Training]</b> Training cancelled by user (min rows dialog).")
-            return
-        # Check if data already exists and is sufficient
-        df_hist = load_ohlcv(symbol, timeframe)
-        if not df_hist.empty:
-            df_hist = df_hist.rename(columns={col: col.lower() for col in df_hist.columns})
-        valid_rows = len(df_hist.dropna(subset=["open", "high", "low", "close", "volume"])) if not df_hist.empty else 0
-        if valid_rows >= min_rows:
-            self.llm_output.append(f"<b>[ML Training]</b> Using existing data for {symbol} ({timeframe}). Valid rows: {valid_rows}")
-        else:
-            confirm = QMessageBox.question(
-                self,
-                "Download Historical Data",
-                f"Do you want to download the last {rows} rows of historical data for {symbol} ({timeframe}) before training?",
-                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
-            )
-            if confirm != QMessageBox.StandardButton.Yes:
-                self.llm_output.append("<b>[ML Training]</b> Training cancelled by user.")
-                return
-            self.progress_bar.setVisible(True)
-            self.progress_bar.setValue(0)
-            self.progress_bar.setFormat("Downloading historical data... %p%")
-            QApplication.processEvents()
-            chunk_size = min(200, rows)
-            all_ohlcv = []
+        fetch_tf = tf_map.get(timeframe, timeframe)
+        df_hist = load_ohlcv(symbol, fetch_tf)
+        # If not enough rows, try to fetch more
+        if df_hist.shape[0] < rows:
             from Data.okx_public_data import fetch_okx_ohlcv
-            for start in range(0, rows, chunk_size):
-                limit = min(chunk_size, rows - start)
-                ohlcv = fetch_okx_ohlcv(symbol, fetch_tf, limit=limit)
-                if not ohlcv:
-                    self.progress_bar.setVisible(False)
-                    QMessageBox.critical(self, "Download Failed", f"Failed to download historical data for {symbol} ({timeframe}). Training cancelled.")
-                    self.llm_output.append("<b>[ML Training]</b> Download failed. Training cancelled.")
-                    return
-                all_ohlcv.extend(ohlcv)
-                pct = int(100 * (start + limit) / rows)
-                self.progress_bar.setValue(min(pct, 100))
-                QApplication.processEvents()
-            from src.utils.data_storage import save_ohlcv
-            save_ohlcv(symbol, timeframe, all_ohlcv)
-            self.progress_bar.setVisible(False)
-            self.llm_output.append(f"<b>[ML Training]</b> Downloaded {len(all_ohlcv)} rows for {symbol} ({timeframe}). Starting training...")
-            QApplication.processEvents()
-            df_hist = load_ohlcv(symbol, timeframe)
-            if not df_hist.empty:
-                df_hist = df_hist.rename(columns={col: col.lower() for col in df_hist.columns})
+            ohlcv = fetch_okx_ohlcv(symbol, fetch_tf, limit=rows)
+            if ohlcv:
+                save_ohlcv(symbol, fetch_tf, ohlcv)
+                df_hist = load_ohlcv(symbol, fetch_tf)
         if df_hist.empty:
             self.llm_output.setHtml("<b>[ML Training]</b> No historical data available for this symbol/timeframe.")
             return
-        # Ensure at least min_rows after cleaning
         valid_rows = len(df_hist.dropna(subset=["open", "high", "low", "close", "volume"]))
         self.llm_output.append(f"<b>[ML Training]</b> Valid rows after cleaning: {valid_rows}")
-        if valid_rows < min_rows:
-            QMessageBox.warning(self, "Not Enough Data", f"Not enough valid data for indicator calculation. At least {min_rows} rows are required after cleaning. Please select a longer timeframe or fetch more data.")
-            self.llm_output.setHtml(f"<b>[ML Training]</b> Not enough valid data for indicator calculation. At least {min_rows} rows are required after cleaning. Valid rows: {valid_rows}")
-            return
         try:
-            df_hist = self.add_technical_indicators(df_hist, min_rows=min_rows)
+            df_hist = self.add_technical_indicators(df_hist, min_rows=rows)
         except ValueError as e:
             self.llm_output.setHtml(f"<b>[ML Training]</b> {e}")
             return
@@ -763,6 +800,7 @@ Do NOT provide trading recommendations, entry/exit prices, or any rationale for 
         self.llm_output.setHtml(self.format_ml_training_result_html(results))
 
     def run_backtest(self):
+        self.update_row_suggestion()
         custom = self.select_pair_button.text().strip().upper()
         if custom:
             symbol = f"{custom}/USDT"
@@ -770,27 +808,57 @@ Do NOT provide trading recommendations, entry/exit prices, or any rationale for 
             self.llm_output.setHtml("<b>[Backtest]</b> Please enter a symbol (e.g., BTC) in the Pair field.")
             return
         timeframe = self.timeframe_combo.currentText()
-        df_hist = load_ohlcv(symbol, timeframe)
+        rows = self.rows_spinbox.value()
+        tf_map = {
+            "5m": "5m",
+            "15m": "15m",
+            "30m": "30m",
+            "1h": "1H",
+            "4h": "4H",
+            "1d": "1D",
+            "1w": "1W",
+            "1m": "1m",
+            "3m": "3m",
+            "1M": "1M",
+        }
+        fetch_tf = tf_map.get(timeframe, timeframe)
+        df_hist = load_ohlcv(symbol, fetch_tf)
+        # If not enough rows, try to fetch more
+        if df_hist.shape[0] < rows:
+            from Data.okx_public_data import fetch_okx_ohlcv
+            ohlcv = fetch_okx_ohlcv(symbol, fetch_tf, limit=rows)
+            if ohlcv:
+                save_ohlcv(symbol, fetch_tf, ohlcv)
+                df_hist = load_ohlcv(symbol, fetch_tf)
         if df_hist.empty:
             self.llm_output.setHtml("<b>[Backtest]</b> No historical data available for this symbol/timeframe.")
             return
-        # Prompt for number of splits
-        n_splits, ok = QInputDialog.getInt(self, "Backtest Splits", "Number of walk-forward splits:", 5, 2, 20, 1)
-        if not ok:
-            return
+        selected_strategy = self.strategy_combo.currentText()
+        if selected_strategy == "ML Model":
+            strategy_fn = None
+        elif selected_strategy == "Moving Average Crossover":
+            strategy_fn = lambda df: moving_average_crossover_strategy(df, short=10, long=30)
+        elif selected_strategy == "RSI":
+            strategy_fn = rsi_strategy
+        elif selected_strategy == "Buy & Hold":
+            strategy_fn = buy_and_hold_strategy
+        else:
+            strategy_fn = None
         # Ensure MLAnalyzer uses the selected algorithm
         if self.ml_analyzer.algorithm != self.selected_algorithm:
             self.on_algorithm_changed(self.selected_algorithm)
-        results = self.ml_analyzer.backtest(df_hist, n_splits=n_splits)
-        self.llm_output.setHtml(self.format_backtest_result_html(results))
+        results = self.ml_analyzer.backtest(df_hist, strategy=strategy_fn)
+        self.llm_output.setHtml(self.format_backtest_result_html(results, selected_strategy))
 
-    def format_backtest_result_html(self, result: dict) -> str:
+    def format_backtest_result_html(self, result: dict, strategy_name: str) -> str:
         html = f"""
-        <h2>ML Model Backtest Summary</h2>
-        <b>Algorithm:</b> {result.get('algorithm', 'N/A')}<br>
+        <div style='font-family:Arial,sans-serif;'>
+        <h2 style='margin-bottom:0;'>Backtest Summary</h2>
+        <b>Strategy:</b> {strategy_name}<br>
+        <b>Algorithm:</b> {result.get('algorithm', '')}<br>
         <b>Splits:</b> {result.get('splits', 'N/A')}<br>
         <b>Timestamp:</b> {result.get('timestamp', '')}<br>
-        <br>
+        <hr style='margin:8px 0;'>
         <b>Mean Metrics:</b><br>
         <table border='1' cellpadding='4' cellspacing='0'>
             <tr><th>Metric</th><th>Value</th></tr>
@@ -849,15 +917,15 @@ Do NOT provide trading recommendations, entry/exit prices, or any rationale for 
                         html += f"<td align='right'>{cr[label]['f1-score']:.4f}</td>"
                         html += f"<td align='right'>{cr[label]['support']}</td></tr>"
                 html += "</table></details>"
+        html += "</div>"
         return html
 
     def on_algorithm_changed(self, algorithm: str):
-        """Update the MLAnalyzer to use the selected algorithm."""
         self.selected_algorithm = algorithm
-        # Re-instantiate MLAnalyzer with new algorithm
         import config
         config.ML_ALGORITHM = algorithm  # Update global config
         self.ml_analyzer = MLAnalyzer()  # Recreate analyzer with new config
+        self.update_row_suggestion()
 
     def get_current_symbol(self) -> str:
         return self.select_pair_button.text().strip().upper()
@@ -904,6 +972,10 @@ Do NOT provide trading recommendations, entry/exit prices, or any rationale for 
         self.pair_list = QListWidget()
         layout.addWidget(QLabel("Select a Pair:"))
         layout.addWidget(self.pair_list)
+        self.exchange_combo = QComboBox()
+        self.exchange_combo.addItems(["All", "OKX", "Blofin"])
+        layout.addWidget(QLabel("Exchange:"))
+        layout.addWidget(self.exchange_combo)
         self.pair_menu_widget.setLayout(layout)
         # Add to main layout (assume it's the parent of data_table)
         self.centralWidget().layout().addWidget(self.pair_menu_widget)
@@ -954,12 +1026,7 @@ Do NOT provide trading recommendations, entry/exit prices, or any rationale for 
         self.pair_list.addItems(self.all_pairs)
         self.pair_list.itemClicked.connect(self.select_pair_from_menu)
         self.pair_search_input.textChanged.connect(self.filter_pair_list)
-
-    def filter_pair_list(self, text):
-        text = text.strip().upper()
-        self.pair_list.clear()
-        filtered = [p for p in self.all_pairs if text in p.upper()]
-        self.pair_list.addItems(filtered)
+        self.exchange_combo.currentTextChanged.connect(lambda: self.filter_pair_list(self.pair_search_input.text()))
 
     def select_pair_from_menu(self, item):
         label = item.text()
@@ -1047,6 +1114,17 @@ Do NOT provide trading recommendations, entry/exit prices, or any rationale for 
             self.data_timestamp_label.setText(f"<b>Last Data Fetch:</b> {ts_str}")
         else:
             self.data_timestamp_label.setText("<b>Last Data Fetch:</b> --")
+
+    def run_optuna_dashboard(self):
+        """Prompt for Optuna storage URI and port, then launch the dashboard."""
+        storage, ok = QInputDialog.getText(self, "Optuna Storage URI", "Enter Optuna storage URI:", QLineEdit.EchoMode.Normal, "sqlite:///example.db")
+        if not ok or not storage:
+            return
+        port, ok = QInputDialog.getInt(self, "Optuna Dashboard Port", "Enter port for dashboard:", 8080, 1024, 65535, 1)
+        if not ok:
+            return
+        launch_optuna_dashboard(storage, port)
+        self.llm_output.append(f"<b>[Optuna]</b> Dashboard launched at <a href='http://localhost:{port}'>http://localhost:{port}</a> for storage: {storage}")
 
 def call_ollama_llm(prompt: str, model: str = "llama2", temperature: float = 0.2, max_tokens: int = 512) -> str:
     """
