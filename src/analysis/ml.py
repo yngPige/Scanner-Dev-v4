@@ -934,6 +934,67 @@ class MLAnalyzer:
         results['mean_sharpe'] = float(np.mean(split_sharpes)) if split_sharpes else 0.0
         return results
 
+    def backtest_limit_orders(self, klines_data: pd.DataFrame, fee: float = 0.001) -> dict:
+        """
+        Backtest the limit order recommendations over historical data.
+
+        Args:
+            klines_data (pd.DataFrame): Historical OHLCV data (must include open, high, low, close).
+            fee (float): Trading fee per trade (fraction).
+
+        Returns:
+            dict: Backtest results and trade log (win rate, avg risk/reward, total trades, total pnl, trades list).
+        """
+        trades = []
+        klines_data = klines_data.reset_index(drop=True)
+        for i in range(len(klines_data) - 1):
+            df_slice = klines_data.iloc[:i+1]
+            row = klines_data.iloc[i]
+            next_row = klines_data.iloc[i + 1]
+            # Generate limit orders for this bar
+            rec = self.predict(df_slice)
+            support = compute_support_levels(df_slice, window=20)
+            resistance = compute_resistance_levels(df_slice, window=20)
+            orders = self._generate_limit_order_recommendations(
+                df_slice,
+                rec.get("recommendation", "HOLD"),
+                rec.get("confidence", 0),
+                support,
+                resistance,
+                rec.get("current_price", row["close"])
+            )
+            for entry in orders.get("entry", []):
+                entry_price = entry["price"]
+                # Simulate if entry is hit in next bar
+                if next_row["low"] <= entry_price <= next_row["high"]:
+                    # Find corresponding TP/SL
+                    for tp in orders.get("take_profit", []):
+                        tp_price = tp["price"]
+                        hit_tp = (next_row["high"] >= tp_price) if tp_price > entry_price else (next_row["low"] <= tp_price)
+                        for sl in orders.get("stop_loss", []):
+                            sl_price = sl["price"]
+                            hit_sl = (next_row["low"] <= sl_price) if sl_price < entry_price else (next_row["high"] >= sl_price)
+                            # Determine which is hit first (TP wins if both hit)
+                            if hit_tp and (not hit_sl or next_row["high"] >= tp_price):
+                                pnl = (tp_price - entry_price) - fee * entry_price
+                                trades.append({"entry": entry_price, "exit": tp_price, "type": "TP", "pnl": pnl, "i": i})
+                            elif hit_sl:
+                                pnl = (sl_price - entry_price) - fee * entry_price
+                                trades.append({"entry": entry_price, "exit": sl_price, "type": "SL", "pnl": pnl, "i": i})
+        wins = [t for t in trades if t["type"] == "TP"]
+        losses = [t for t in trades if t["type"] == "SL"]
+        win_rate = len(wins) / len(trades) if trades else 0
+        avg_risk_reward = (
+            sum(t["pnl"] for t in wins) / abs(sum(t["pnl"] for t in losses)) if losses else 0
+        )
+        return {
+            "trades": trades,
+            "win_rate": win_rate,
+            "avg_risk_reward": avg_risk_reward,
+            "total_trades": len(trades),
+            "total_pnl": sum(t["pnl"] for t in trades)
+        }
+
 def format_ml_training_result(result: dict) -> str:
     lines = []
     lines.append(f"ML Model Training Summary")
