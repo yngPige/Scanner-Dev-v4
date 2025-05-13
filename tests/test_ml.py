@@ -24,10 +24,11 @@ def test_ml_analyzer_backtest():
         'high': np.arange(100) + 1,
         'low': np.arange(100) - 1,
         'close': np.arange(100),
-        'volume': np.random.rand(100) * 100,
-        'target': np.random.randint(0, 2, size=100)
+        'volume': np.random.rand(100) * 100
     })
     analyzer = MLAnalyzer(ML_CONFIG)
-    results = analyzer.backtest(df.drop('target', axis=1), df['target'], n_splits=3)
+    results = analyzer.backtest(df, n_splits=3)
     assert 'accuracy' in results
-    assert 'f1' in results 
+    assert 'f1' in results
+    assert 'split_metrics' in results
+    assert isinstance(results['split_metrics'], list) 

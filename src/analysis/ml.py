@@ -24,6 +24,11 @@ from src.utils.helpers import calculate_technical_indicators
 from src.utils.helpers import compute_support_levels, compute_resistance_levels
 from xgboost import XGBClassifier
 import warnings
+import optuna
+from optuna import Trial, Study
+from typing import Any, Dict, Optional, Callable
+import matplotlib.pyplot as plt
+import subprocess
 
 warnings.filterwarnings("ignore", category=UserWarning, module="xgboost")
 
@@ -379,11 +384,7 @@ class MLAnalyzer:
 
         # For BUY recommendation
         if recommendation == "BUY":
-            # Entry points: Just below current price and at support levels
-            # Stronger confidence = closer to current price
             confidence_factor = confidence / 100  # 0 to 1
-
-            # Primary entry point - slightly below current price
             primary_entry = current_price * (1 - (0.01 * spacing_factor * (1 - confidence_factor)))
             limit_orders["entry"].append({
                 "price": primary_entry,
@@ -391,10 +392,8 @@ class MLAnalyzer:
                 "description": "Primary entry point slightly below current price",
                 "confidence": "HIGH"
             })
-
-            # Secondary entry points at support levels
-            for i, support in enumerate(relevant_supports[:2]):  # Use top 2 support levels
-                if support < primary_entry * 0.98:  # Avoid too close to primary
+            for i, support in enumerate(relevant_supports[:2]):
+                if support < primary_entry * 0.98:
                     confidence_level = "MEDIUM" if i == 0 else "LOW"
                     limit_orders["entry"].append({
                         "price": support,
@@ -402,9 +401,8 @@ class MLAnalyzer:
                         "description": f"Support level entry point",
                         "confidence": confidence_level
                     })
-
             # Take profit at resistance levels
-            for i, resistance in enumerate(relevant_resistances[:3]):  # Use top 3 resistance levels
+            for i, resistance in enumerate(relevant_resistances[:3]):
                 confidence_level = "HIGH" if i == 0 else "MEDIUM" if i == 1 else "LOW"
                 limit_orders["take_profit"].append({
                     "price": resistance,
@@ -412,19 +410,24 @@ class MLAnalyzer:
                     "description": f"Take profit at resistance level",
                     "confidence": confidence_level
                 })
-
-            # If no resistance levels, use percentage-based take profits
+            # If no resistance levels, use ATR-based and percentage-based take profits
             if not limit_orders["take_profit"]:
+                for i, mult in enumerate([1.5, 2, 3]):
+                    limit_orders["take_profit"].append({
+                        "price": primary_entry + mult * atr,
+                        "type": "LIMIT",
+                        "description": f"Take profit at {mult} ATR above entry",
+                        "confidence": "MEDIUM" if i == 0 else "LOW"
+                    })
                 for i, pct in enumerate([1.5, 3, 5]):
                     adjusted_pct = pct * spacing_factor
                     confidence_level = "HIGH" if i == 0 else "MEDIUM" if i == 1 else "LOW"
                     limit_orders["take_profit"].append({
-                        "price": current_price * (1 + (adjusted_pct / 100)),
+                        "price": primary_entry * (1 + (adjusted_pct / 100)),
                         "type": "LIMIT",
                         "description": f"Take profit at {adjusted_pct:.1f}% above entry",
                         "confidence": confidence_level
                     })
-
             # Stop loss below nearest support
             if relevant_supports:
                 stop_price = relevant_supports[0] * (1 - (0.02 * spacing_factor))
@@ -435,21 +438,16 @@ class MLAnalyzer:
                     "confidence": "HIGH"
                 })
             else:
-                # Default stop loss
-                stop_price = current_price * (1 - (0.05 * spacing_factor))
+                stop_price = primary_entry - (0.05 * spacing_factor * primary_entry)
                 limit_orders["stop_loss"].append({
                     "price": stop_price,
                     "type": "STOP",
                     "description": f"Stop loss at {(0.05 * spacing_factor) * 100:.1f}% below entry",
                     "confidence": "MEDIUM"
                 })
-
         # For SELL recommendation
         elif recommendation == "SELL":
-            # Entry points: Just above current price and at resistance levels
             confidence_factor = confidence / 100  # 0 to 1
-
-            # Primary entry point - slightly above current price
             primary_entry = current_price * (1 + (0.01 * spacing_factor * (1 - confidence_factor)))
             limit_orders["entry"].append({
                 "price": primary_entry,
@@ -457,10 +455,8 @@ class MLAnalyzer:
                 "description": "Primary entry point slightly above current price",
                 "confidence": "HIGH"
             })
-
-            # Secondary entry points at resistance levels
-            for i, resistance in enumerate(relevant_resistances[:2]):  # Use top 2 resistance levels
-                if resistance > primary_entry * 1.02:  # Avoid too close to primary
+            for i, resistance in enumerate(relevant_resistances[:2]):
+                if resistance > primary_entry * 1.02:
                     confidence_level = "MEDIUM" if i == 0 else "LOW"
                     limit_orders["entry"].append({
                         "price": resistance,
@@ -468,9 +464,8 @@ class MLAnalyzer:
                         "description": f"Resistance level entry point",
                         "confidence": confidence_level
                     })
-
             # Take profit at support levels
-            for i, support in enumerate(relevant_supports[:3]):  # Use top 3 support levels
+            for i, support in enumerate(relevant_supports[:3]):
                 confidence_level = "HIGH" if i == 0 else "MEDIUM" if i == 1 else "LOW"
                 limit_orders["take_profit"].append({
                     "price": support,
@@ -478,19 +473,24 @@ class MLAnalyzer:
                     "description": f"Take profit at support level",
                     "confidence": confidence_level
                 })
-
-            # If no support levels, use percentage-based take profits
+            # If no support levels, use ATR-based and percentage-based take profits
             if not limit_orders["take_profit"]:
+                for i, mult in enumerate([1.5, 2, 3]):
+                    limit_orders["take_profit"].append({
+                        "price": primary_entry - mult * atr,
+                        "type": "LIMIT",
+                        "description": f"Take profit at {mult} ATR below entry",
+                        "confidence": "MEDIUM" if i == 0 else "LOW"
+                    })
                 for i, pct in enumerate([1.5, 3, 5]):
                     adjusted_pct = pct * spacing_factor
                     confidence_level = "HIGH" if i == 0 else "MEDIUM" if i == 1 else "LOW"
                     limit_orders["take_profit"].append({
-                        "price": current_price * (1 - (adjusted_pct / 100)),
+                        "price": primary_entry * (1 - (adjusted_pct / 100)),
                         "type": "LIMIT",
                         "description": f"Take profit at {adjusted_pct:.1f}% below entry",
                         "confidence": confidence_level
                     })
-
             # Stop loss above nearest resistance
             if relevant_resistances:
                 stop_price = relevant_resistances[0] * (1 + (0.02 * spacing_factor))
@@ -501,8 +501,7 @@ class MLAnalyzer:
                     "confidence": "HIGH"
                 })
             else:
-                # Default stop loss
-                stop_price = current_price * (1 + (0.05 * spacing_factor))
+                stop_price = primary_entry + (0.05 * spacing_factor * primary_entry)
                 limit_orders["stop_loss"].append({
                     "price": stop_price,
                     "type": "STOP",
@@ -817,21 +816,29 @@ class MLAnalyzer:
                 "reasoning": "Error in analysis"
             }
 
-    def backtest(self, klines_data: pd.DataFrame, n_splits: int = 5, initial_balance: float = 10000.0, fee: float = 0.001) -> dict:
+    def backtest(
+        self,
+        klines_data: pd.DataFrame,
+        n_splits: int = 5,
+        initial_balance: float = 10000.0,
+        fee: float = 0.001,
+        strategy: Optional[Callable[[pd.DataFrame], np.ndarray]] = None
+    ) -> dict:
         """
-        Perform walk-forward backtesting with the current ML pipeline, including advanced metrics and trading simulation.
+        Perform walk-forward backtesting with the current ML pipeline or a user-selected strategy.
 
         Args:
             klines_data (pd.DataFrame): Historical price data
             n_splits (int): Number of walk-forward splits
             initial_balance (float): Starting balance for trading simulation
             fee (float): Trading fee per trade (fraction)
+            strategy (Optional[Callable]): If provided, use this strategy function for signal generation.
 
         Returns:
             dict: Backtest results with mean and per-split metrics, trading simulation
         """
         results = {
-            'algorithm': self.algorithm,
+            'algorithm': self.algorithm if strategy is None else getattr(strategy, '__name__', str(strategy)),
             'splits': n_splits,
             'split_metrics': [],
             'timestamp': datetime.now().isoformat()
@@ -857,71 +864,76 @@ class MLAnalyzer:
             X_train, X_test = X_clean.iloc[train_idx], X_clean.iloc[test_idx]
             y_train, y_test = y_clean.iloc[train_idx], y_clean.iloc[test_idx]
             prices_test = close_prices[test_idx]
-            pipeline = Pipeline([
-                ('scaler', StandardScaler()),
-                ('model', self._create_model())
-            ])
-            try:
+            if strategy is not None:
+                y_pred = strategy(X_test)
+                # If strategy returns -1 for hold, treat as no position (flat)
+                y_pred = np.where(y_pred == -1, 0, y_pred)
+            else:
+                pipeline = Pipeline([
+                    ('scaler', StandardScaler()),
+                    ('model', self._create_model())
+                ])
                 pipeline.fit(X_train, y_train)
                 y_pred = pipeline.predict(X_test)
-                y_proba = pipeline.predict_proba(X_test)[:, 1] if hasattr(pipeline.named_steps['model'], 'predict_proba') else None
-                acc = accuracy_score(y_test, y_pred)
-                f1 = f1_score(y_test, y_pred, zero_division=0)
-                prec = precision_score(y_test, y_pred, zero_division=0)
-                rec = recall_score(y_test, y_pred, zero_division=0)
-                bal_acc = balanced_accuracy_score(y_test, y_pred)
-                auc = roc_auc_score(y_test, y_proba) if y_proba is not None else None
-                cm = confusion_matrix(y_test, y_pred).tolist()
-                class_report = classification_report(y_test, y_pred, output_dict=True, zero_division=0)
-                # Trading simulation
-                balance = initial_balance
-                position = 0  # 1 for long, -1 for short, 0 for flat
-                equity_curve = [balance]
-                for i, (pred, true, price) in enumerate(zip(y_pred, y_test, prices_test)):
-                    # Simple strategy: Buy if pred==1, Sell if pred==0, close at next step
-                    if pred == 1 and position == 0:
-                        position = 1
-                        entry_price = price * (1 + fee)
-                    elif pred == 0 and position == 0:
-                        position = -1
-                        entry_price = price * (1 - fee)
-                    elif position != 0:
-                        # Close position at next step
-                        pnl = (price - entry_price) if position == 1 else (entry_price - price)
-                        balance += pnl
-                        balance -= abs(pnl) * fee  # apply fee on exit
-                        position = 0
-                    equity_curve.append(balance)
-                returns = np.diff(equity_curve)
-                cum_return = (equity_curve[-1] - initial_balance) / initial_balance
-                max_drawdown = 0
-                peak = equity_curve[0]
-                for x in equity_curve:
-                    if x > peak:
-                        peak = x
-                    dd = (peak - x) / peak
-                    if dd > max_drawdown:
-                        max_drawdown = dd
-                sharpe = (np.mean(returns) / np.std(returns)) * np.sqrt(252) if np.std(returns) > 0 else 0
-                accs.append(acc)
-                f1s.append(f1)
-                precisions.append(prec)
-                recalls.append(rec)
-                bal_accs.append(bal_acc)
-                if auc is not None:
-                    aucs.append(auc)
-                split_conf_matrices.append(cm)
-                split_returns.append(cum_return)
-                split_drawdowns.append(max_drawdown)
-                split_sharpes.append(sharpe)
-                results['split_metrics'].append({
-                    'accuracy': acc, 'f1': f1, 'precision': prec, 'recall': rec,
-                    'balanced_accuracy': bal_acc, 'auc': auc, 'confusion_matrix': cm,
-                    'cumulative_return': cum_return, 'max_drawdown': max_drawdown, 'sharpe': sharpe,
-                    'classification_report': class_report
-                })
-            except Exception as e:
-                results['split_metrics'].append({'accuracy': 0, 'f1': 0, 'error': str(e)})
+            y_proba = None
+            if hasattr(self.model, 'predict_proba'):
+                try:
+                    y_proba = self.model.predict_proba(X_test)[:, 1]
+                except Exception:
+                    y_proba = None
+            acc = accuracy_score(y_test, y_pred)
+            f1 = f1_score(y_test, y_pred, zero_division=0)
+            prec = precision_score(y_test, y_pred, zero_division=0)
+            rec = recall_score(y_test, y_pred, zero_division=0)
+            bal_acc = balanced_accuracy_score(y_test, y_pred)
+            auc = roc_auc_score(y_test, y_proba) if y_proba is not None else None
+            cm = confusion_matrix(y_test, y_pred).tolist()
+            class_report = classification_report(y_test, y_pred, output_dict=True, zero_division=0)
+            # Trading simulation
+            balance = initial_balance
+            position = 0
+            equity_curve = [balance]
+            for i, (pred, true, price) in enumerate(zip(y_pred, y_test, prices_test)):
+                if pred == 1 and position == 0:
+                    position = 1
+                    entry_price = price * (1 + fee)
+                elif pred == 0 and position == 0:
+                    position = -1
+                    entry_price = price * (1 - fee)
+                elif position != 0:
+                    pnl = (price - entry_price) if position == 1 else (entry_price - price)
+                    balance += pnl
+                    balance -= abs(pnl) * fee
+                    position = 0
+                equity_curve.append(balance)
+            returns = np.diff(equity_curve)
+            cum_return = (equity_curve[-1] - initial_balance) / initial_balance
+            max_drawdown = 0
+            peak = equity_curve[0]
+            for x in equity_curve:
+                if x > peak:
+                    peak = x
+                dd = (peak - x) / peak
+                if dd > max_drawdown:
+                    max_drawdown = dd
+            sharpe = (np.mean(returns) / np.std(returns)) * np.sqrt(252) if np.std(returns) > 0 else 0
+            accs.append(acc)
+            f1s.append(f1)
+            precisions.append(prec)
+            recalls.append(rec)
+            bal_accs.append(bal_acc)
+            if auc is not None:
+                aucs.append(auc)
+            split_conf_matrices.append(cm)
+            split_returns.append(cum_return)
+            split_drawdowns.append(max_drawdown)
+            split_sharpes.append(sharpe)
+            results['split_metrics'].append({
+                'accuracy': acc, 'f1': f1, 'precision': prec, 'recall': rec,
+                'balanced_accuracy': bal_acc, 'auc': auc, 'confusion_matrix': cm,
+                'cumulative_return': cum_return, 'max_drawdown': max_drawdown, 'sharpe': sharpe,
+                'classification_report': class_report
+            })
         results['accuracy'] = float(np.mean(accs)) if accs else 0.0
         results['f1'] = float(np.mean(f1s)) if f1s else 0.0
         results['precision'] = float(np.mean(precisions)) if precisions else 0.0
@@ -995,6 +1007,118 @@ class MLAnalyzer:
             "total_pnl": sum(t["pnl"] for t in trades)
         }
 
+    def optimize_with_optuna(
+        self,
+        klines_data: pd.DataFrame,
+        model_type: str = "RandomForest",
+        n_trials: int = 20,
+        direction: str = "maximize",
+        study_name: str = "ml_optuna_study",
+        storage: Optional[str] = None,
+        show_progress_bar: bool = True,
+    ) -> Study:
+        """
+        Optimize model hyperparameters using Optuna and track multiple metrics for each trial.
+
+        Args:
+            klines_data (pd.DataFrame): Historical price data for training/validation.
+            model_type (str): Model to optimize ("RandomForest", "XGBoost", "SVM").
+            n_trials (int): Number of Optuna trials.
+            direction (str): "maximize" or "minimize" the objective (accuracy).
+            study_name (str): Name for the Optuna study.
+            storage (Optional[str]): Optuna storage URI for persistent studies.
+            show_progress_bar (bool): Whether to show Optuna's progress bar.
+
+        Returns:
+            Study: The Optuna study object with all trial results.
+        """
+        import sklearn
+        from sklearn.model_selection import train_test_split
+        from sklearn.metrics import accuracy_score, f1_score, precision_score, recall_score, roc_auc_score
+
+        def objective(trial: Trial) -> float:
+            # Model selection and hyperparameter search space
+            if model_type == "RandomForest":
+                n_estimators = trial.suggest_int("n_estimators", 50, 200)
+                max_depth = trial.suggest_int("max_depth", 3, 20)
+                min_samples_split = trial.suggest_int("min_samples_split", 2, 10)
+                min_samples_leaf = trial.suggest_int("min_samples_leaf", 1, 4)
+                model = sklearn.ensemble.RandomForestClassifier(
+                    n_estimators=n_estimators,
+                    max_depth=max_depth,
+                    min_samples_split=min_samples_split,
+                    min_samples_leaf=min_samples_leaf,
+                    random_state=42,
+                    n_jobs=-1
+                )
+            elif model_type == "XGBoost":
+                from xgboost import XGBClassifier
+                n_estimators = trial.suggest_int("n_estimators", 50, 200)
+                max_depth = trial.suggest_int("max_depth", 3, 20)
+                learning_rate = trial.suggest_float("learning_rate", 0.01, 0.3)
+                model = XGBClassifier(
+                    n_estimators=n_estimators,
+                    max_depth=max_depth,
+                    learning_rate=learning_rate,
+                    random_state=42,
+                    use_label_encoder=False,
+                    eval_metric='logloss',
+                    n_jobs=-1
+                )
+            elif model_type == "SVM":
+                c = trial.suggest_float("C", 0.1, 10.0, log=True)
+                gamma = trial.suggest_float("gamma", 1e-4, 1e-1, log=True)
+                model = sklearn.svm.SVC(
+                    kernel='rbf',
+                    C=c,
+                    gamma=gamma,
+                    probability=True,
+                    random_state=42
+                )
+            else:
+                raise ValueError(f"Unsupported model_type: {model_type}")
+
+            # Prepare data
+            data = calculate_technical_indicators(klines_data)
+            y, labeled_df = self._prepare_labels(data, horizon=self.prediction_horizon)
+            y_series = pd.Series(y, index=labeled_df.index)
+            mask = ~data.isnull().any(axis=1) & ~y_series.isnull()
+            X_clean = data[mask]
+            y_clean = y_series[mask]
+            if len(X_clean) < 50:
+                trial.report(0.0, step=0)
+                return 0.0
+            X_train, X_valid, y_train, y_valid = train_test_split(X_clean, y_clean, test_size=0.2, random_state=42)
+
+            # Train and evaluate
+            model.fit(X_train, y_train)
+            y_pred = model.predict(X_valid)
+            y_proba = model.predict_proba(X_valid)[:, 1] if hasattr(model, "predict_proba") else None
+
+            acc = accuracy_score(y_valid, y_pred)
+            f1 = f1_score(y_valid, y_pred, zero_division=0)
+            prec = precision_score(y_valid, y_pred, zero_division=0)
+            rec = recall_score(y_valid, y_pred, zero_division=0)
+            auc = roc_auc_score(y_valid, y_proba) if y_proba is not None else None
+
+            # Log all metrics
+            trial.set_user_attr("accuracy", acc)
+            trial.set_user_attr("f1", f1)
+            trial.set_user_attr("precision", prec)
+            trial.set_user_attr("recall", rec)
+            trial.set_user_attr("auc", auc)
+
+            return acc  # or f1, depending on your optimization goal
+
+        study = optuna.create_study(
+            direction=direction,
+            study_name=study_name,
+            storage=storage,
+            load_if_exists=True
+        )
+        study.optimize(objective, n_trials=n_trials, show_progress_bar=show_progress_bar)
+        return study
+
 def format_ml_training_result(result: dict) -> str:
     lines = []
     lines.append(f"ML Model Training Summary")
@@ -1022,3 +1146,44 @@ def format_ml_training_result(result: dict) -> str:
         for feat, imp in sorted_fi[:10]:
             lines.append(f"  {feat:15s} {imp:.4f}")
     return "\n".join(lines)
+
+def plot_optuna_results(study: optuna.Study) -> None:
+    """
+    Visualize Optuna study results: optimization history, parameter importance, and parallel coordinates.
+
+    Args:
+        study (optuna.Study): The Optuna study object to visualize.
+
+    Returns:
+        None
+
+    Example:
+        >>> study = analyzer.optimize_with_optuna(df, model_type="XGBoost", n_trials=50)
+        >>> plot_optuna_results(study)
+    """
+    import optuna.visualization
+    optuna.visualization.plot_optimization_history(study).show()
+    optuna.visualization.plot_param_importances(study).show()
+    optuna.visualization.plot_parallel_coordinate(study).show()
+
+def launch_optuna_dashboard(storage: str, port: int = 8080) -> None:
+    """
+    Launch the Optuna dashboard for interactive study visualization.
+
+    Args:
+        storage (str): The Optuna storage URI (e.g., 'sqlite:///example.db').
+        port (int): The port to run the dashboard on (default: 8080).
+
+    Returns:
+        None
+
+    Example:
+        >>> launch_optuna_dashboard('sqlite:///example.db', port=8080)
+    """
+    try:
+        print(f"Launching Optuna dashboard at http://localhost:{port} ...")
+        subprocess.Popen([
+            "optuna", "dashboard", storage, "--port", str(port)
+        ])
+    except Exception as e:
+        print(f"Failed to launch Optuna dashboard: {e}")
