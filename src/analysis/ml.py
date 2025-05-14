@@ -738,7 +738,7 @@ class MLAnalyzer:
             # --- Always set key_indicators ---
             latest = klines_data.iloc[-1]
             key_indicators = {}
-            for col in ['rsi', 'macd', 'macd_signal', 'ema_21', 'sma_20', 'bbands_u', 'bbands_l', 'atr_14', 'adx_14', 'obv', 'willr_14']:
+            for col in ['rsi', 'macd', 'macd_signal', 'ema_9', 'ema_20', 'ema_50', 'ema_100', 'bbands_u', 'bbands_l', 'atr_14', 'adx_14', 'obv', 'willr_14']:
                 if col in latest:
                     key_indicators[col] = float(latest[col])
             prediction['key_indicators'] = key_indicators if key_indicators else None

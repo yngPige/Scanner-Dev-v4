@@ -15,21 +15,39 @@ from PyQt6.QtWidgets import (
 from PyQt6.QtCore import Qt, QThread, pyqtSignal, QTimer
 from PyQt6.QtGui import QIcon
 from datetime import datetime, timezone
-from Data.okx_public_data import fetch_okx_ticker, fetch_okx_ohlcv
-import requests
-from src.analysis.ml import MLAnalyzer, launch_optuna_dashboard
-import pandas as pd
+from Data.okx_public_data import fetch_okx_ticker
+from Data.blofin_oublic_data import fetch_blofin_instruments, get_blofin_spot_pairs_via_ws
+from backtest_strategies.strategies import moving_average_crossover_strategy, rsi_strategy, buy_and_hold_strategy
 from src.utils.data_storage import save_ohlcv, load_ohlcv
+from src.utils.helpers import fetch_ohlcv
+import pandas as pd
 import pandas_ta as ta
 import numpy as np
 from dotenv import load_dotenv
 import os
-from Data.blofin_oublic_data import BlofinWebSocketClient, fetch_blofin_instruments, get_blofin_spot_pairs_via_ws
-from backtest_strategies.strategies import moving_average_crossover_strategy, rsi_strategy, buy_and_hold_strategy
+import requests
+from src.analysis.ml import MLAnalyzer, launch_optuna_dashboard
 
 load_dotenv()
 
 class MainWindow(QMainWindow):
+    timeframe_map = {
+        '5m': '5m',
+        '15m': '15m',
+        '30m': '30m',
+        '1h': '1H',
+        '1H': '1H',
+        '4h': '4H',
+        '4H': '4H',
+        '1d': '1D',
+        '1D': '1D',
+        '1w': '1W',
+        '1W': '1W',
+        '1m': '1m',
+        '3m': '3m',
+        '1M': '1M',
+    }
+
     def __init__(self):
         super().__init__()
         self.setWindowIcon(QIcon("assets/icon.png"))
@@ -38,77 +56,8 @@ class MainWindow(QMainWindow):
         self.selected_algorithm = "RandomForest"  # Default
         self.ml_analyzer = MLAnalyzer()
         self.pair_sources = {}  # Ensure pair_sources is always initialized
+        self.ccxt_pair_cache = {}  # Added for caching CCXT pairs
         self.init_ui()
-        # Add dynamic suggestion label
-        self.row_suggestion_label = QLabel()
-        self.row_suggestion_label.setText("")
-        self.row_suggestion_label.setStyleSheet("font-size:12px;")
-        self.centralWidget().layout().insertWidget(1, self.row_suggestion_label)
-        # Connect signals for dynamic update
-        self.timeframe_combo.currentTextChanged.connect(self.update_row_suggestion)
-        self.algorithm_combo.currentTextChanged.connect(self.update_row_suggestion)
-
-    def update_row_suggestion(self):
-        timeframe = self.timeframe_combo.currentText()
-        algorithm = self.algorithm_combo.currentText()
-        rows = self.rows_spinbox.value()
-        # Heuristic: higher frequency needs more rows
-        tf_rows = {
-            "5m": 2000,
-            "15m": 1500,
-            "30m": 1000,
-            "1h": 800,
-            "4h": 500,
-            "1d": 300,
-            "1w": 100,
-            "1m": 2000,
-            "3m": 1500,
-            "1M": 50,
-        }
-        algo_factor = {
-            "RandomForest": 1.0,
-            "GradientBoosting": 1.2,
-            "SVM": 1.5,
-            "XGBoost": 1.2,
-        }
-        min_rows = int(tf_rows.get(timeframe, 500) * algo_factor.get(algorithm, 1.0))
-        # Check available rows if possible
-        custom = self.select_pair_button.text().strip().upper()
-        symbol = f"{custom}/USDT" if custom else None
-        tf_map = {
-            "5m": "5m",
-            "15m": "15m",
-            "30m": "30m",
-            "1h": "1H",
-            "4h": "4H",
-            "1d": "1D",
-            "1w": "1W",
-            "1m": "1m",
-            "3m": "3m",
-            "1M": "1M",
-        }
-        fetch_tf = tf_map.get(timeframe, timeframe)
-        available = 0
-        if symbol:
-            try:
-                df = load_ohlcv(symbol, fetch_tf)
-                available = len(df.dropna(subset=["open", "high", "low", "close", "volume"]))
-            except Exception:
-                available = 0
-        # Color code
-        if available == 0:
-            color = "gray"
-            msg = f"Recommended: <b>{min_rows}</b> rows for {algorithm} ({timeframe}). Rows to download: <b>{rows}</b>."
-        elif available < min_rows:
-            color = "red"
-            msg = f"<b>Warning:</b> Only {available} rows available. Recommended: <b>{min_rows}</b>+ rows for {algorithm} ({timeframe}). Rows to download: <b>{rows}</b>."
-        elif available < min_rows * 1.2:
-            color = "orange"
-            msg = f"<b>Borderline:</b> {available} rows available. Recommended: <b>{min_rows}</b>+ rows for {algorithm} ({timeframe}). Rows to download: <b>{rows}</b>."
-        else:
-            color = "green"
-            msg = f"{available} rows available. Recommended: <b>{min_rows}</b>+ rows for {algorithm} ({timeframe}). Rows to download: <b>{rows}</b>."
-        self.row_suggestion_label.setText(f"<span style='color:{color};'>{msg}</span>")
 
     def init_ui(self):
         # Layouts
@@ -126,20 +75,6 @@ class MainWindow(QMainWindow):
         self.timeframe_combo.addItems(["5m", "15m", "30m", "1h", "4h", "1d", "30d"])
         controls_layout.addWidget(QLabel("Timeframe:"))
         controls_layout.addWidget(self.timeframe_combo)
-
-        # Rows to Download
-        self.rows_spinbox = QSpinBox()
-        self.rows_spinbox.setRange(50, 10000)
-        self.rows_spinbox.setValue(1000)
-        self.rows_spinbox.setSingleStep(50)
-        controls_layout.addWidget(QLabel("Rows:"))
-        controls_layout.addWidget(self.rows_spinbox)
-        self.rows_spinbox.valueChanged.connect(self.update_row_suggestion)
-        # Add Set Rows confirmation button
-        self.set_rows_button = QPushButton("Set Rows")
-        self.set_rows_button.setCheckable(True)
-        self.set_rows_button.clicked.connect(self.toggle_rows_edit)
-        controls_layout.addWidget(self.set_rows_button)
 
         # ML Algorithm Selector
         self.algorithm_combo = QComboBox()
@@ -306,38 +241,14 @@ class MainWindow(QMainWindow):
             self.llm_output.setText("Please select a pair.")
             return
         timeframe = self.timeframe_combo.currentText()
-        rows = self.rows_spinbox.value()
-        # Map UI timeframes to OKX valid bars
-        tf_map = {
-            "5m": "5m",
-            "15m": "15m",
-            "30m": "30m",
-            "1h": "1H",
-            "4h": "4H",
-            "1d": "1D",
-            "1w": "1W",
-            "1m": "1m",
-            "3m": "3m",
-            "1M": "1M",
-        }
-        if timeframe == "30d":
-            fetch_tf = "1D"
-            limit = 30
-        else:
-            fetch_tf = tf_map.get(timeframe, timeframe)
-            limit = rows
-        ohlcv = None
-        if hasattr(self, 'selected_exchange') and self.selected_exchange == "Blofin":
-            # Use WebSocket for Blofin OHLCV
-            inst_id = symbol.replace("/", "-") + "-SPOT" if not symbol.endswith("-SPOT") else symbol
-            ws_client = BlofinWebSocketClient()
-            ohlcv = ws_client.fetch_ohlcv(inst_id, bar=fetch_tf, limit=limit, timeout=5.0)
-        else:
-            from Data.okx_public_data import fetch_okx_ohlcv
-            ohlcv = fetch_okx_ohlcv(symbol, fetch_tf, limit=limit)
+        norm_timeframe = self.timeframe_map.get(timeframe, timeframe)
+        rows = 1000
+        exchange = getattr(self, 'selected_exchange', 'OKX')
+        use_ws = (exchange == "Blofin")
+        ohlcv = fetch_ohlcv(exchange, symbol, norm_timeframe, limit=rows, use_ws=use_ws)
         if ohlcv:
             self.data_table.setVisible(True)
-            save_ohlcv(symbol, timeframe, ohlcv)
+            save_ohlcv(symbol, norm_timeframe, ohlcv)
             ohlcv.sort(key=lambda x: x[0], reverse=True)
             top10 = ohlcv[:10]
             self.data_table.setRowCount(len(top10))
@@ -383,7 +294,6 @@ class MainWindow(QMainWindow):
                 pct_item = QTableWidgetItem(f"{change_pct:.2f}%")
                 self.data_table.setItem(row_idx, 6, pct_item)
             self.llm_output.setText("")
-            # Update last data fetch time
             self.last_data_fetch_time = datetime.now(timezone.utc)
             self.refresh_data_timestamp()
         else:
@@ -401,7 +311,8 @@ class MainWindow(QMainWindow):
             self.llm_output.setHtml("<b>[Analysis]</b> Please select an exchange and pair.")
             return
         timeframe = self.timeframe_combo.currentText()
-        df_hist = load_ohlcv(symbol, timeframe)
+        norm_timeframe = self.timeframe_map.get(timeframe, timeframe)
+        df_hist = load_ohlcv(symbol, norm_timeframe)
         if df_hist.empty:
             self.llm_output.setHtml("<b>[Analysis]</b> No historical data available for this symbol/timeframe.")
             return
@@ -589,10 +500,6 @@ Do NOT provide trading recommendations, entry/exit prices, or any rationale for 
             )
         # Add all indicators with pandas_ta default names
         indicators = [
-            ta.sma(df['close'], length=9),
-            ta.sma(df['close'], length=20),
-            ta.sma(df['close'], length=50),
-            ta.sma(df['close'], length=100),
             ta.ema(df['close'], length=9),
             ta.ema(df['close'], length=20),
             ta.ema(df['close'], length=50),
@@ -624,18 +531,9 @@ Do NOT provide trading recommendations, entry/exit prices, or any rationale for 
             raise ValueError(f"Not enough valid data for indicator calculation. At least {min_rows} rows are required after cleaning. Valid rows: {valid_rows}")
         return df
 
-    def toggle_rows_edit(self):
-        if self.set_rows_button.isChecked():
-            self.rows_spinbox.setDisabled(True)
-            self.set_rows_button.setText("Edit Rows")
-            self.llm_output.append(f"Rows set to <b>{self.rows_spinbox.value()}</b>. To change, click 'Edit Rows'.")
-        else:
-            self.rows_spinbox.setDisabled(False)
-            self.set_rows_button.setText("Set Rows")
-            self.llm_output.append("You can now edit the number of rows.")
-
     def train_model(self):
-        self.update_row_suggestion()
+        # Use a default or dynamically determined rows value
+        rows = 1000  # Default value, or compute based on timeframe/algorithm if needed
         custom = self.select_pair_button.text().strip().upper()
         if custom:
             symbol = f"{custom}/USDT"
@@ -643,35 +541,40 @@ Do NOT provide trading recommendations, entry/exit prices, or any rationale for 
             self.llm_output.append("<b>[ML Training]</b> Please enter a symbol (e.g., BTC) in the Pair field.")
             return
         timeframe = self.timeframe_combo.currentText()
-        rows = self.rows_spinbox.value()
-        tf_map = {
-            "5m": "5m",
-            "15m": "15m",
-            "30m": "30m",
-            "1h": "1H",
-            "4h": "4H",
-            "1d": "1D",
-            "1w": "1W",
-            "1m": "1m",
-            "3m": "3m",
-            "1M": "1M",
-        }
-        fetch_tf = tf_map.get(timeframe, timeframe)
-        df_hist = load_ohlcv(symbol, fetch_tf)
+        norm_timeframe = self.timeframe_map.get(timeframe, timeframe)
+        # Determine the max lookback needed by indicators (e.g., EMA 100, MACD 26, etc.)
+        indicator_lookback = max([100, 26, 20, 14])  # EMA 100, MACD slow, BBands, ATR, etc.
+        min_required_rows = rows + indicator_lookback
+        df_hist = load_ohlcv(symbol, norm_timeframe)
         # If not enough rows, try to fetch more
-        if df_hist.shape[0] < rows:
+        if df_hist.shape[0] < min_required_rows:
             from Data.okx_public_data import fetch_okx_ohlcv
-            ohlcv = fetch_okx_ohlcv(symbol, fetch_tf, limit=rows)
+            ohlcv = fetch_okx_ohlcv(symbol, norm_timeframe, limit=min_required_rows)
             if ohlcv:
-                save_ohlcv(symbol, fetch_tf, ohlcv)
-                df_hist = load_ohlcv(symbol, fetch_tf)
+                save_ohlcv(symbol, norm_timeframe, ohlcv)
+                df_hist = load_ohlcv(symbol, norm_timeframe)
         if df_hist.empty:
             self.llm_output.setHtml("<b>[ML Training]</b> No historical data available for this symbol/timeframe.")
             return
         valid_rows = len(df_hist.dropna(subset=["open", "high", "low", "close", "volume"]))
-        self.llm_output.append(f"<b>[ML Training]</b> Valid rows after cleaning: {valid_rows}")
+        # Dynamically adjust rows to fit indicator requirements
+        if valid_rows < indicator_lookback:
+            self.llm_output.setHtml(
+                f"<b>[ML Training]</b> Not enough valid data for indicator calculation. At least {indicator_lookback} rows are required after cleaning. Valid rows: {valid_rows}"
+            )
+            return
+        usable_rows = min(rows, valid_rows - indicator_lookback)
+        if usable_rows < 1:
+            self.llm_output.setHtml(
+                f"<b>[ML Training]</b> Not enough data after indicator lookback. Try lowering the rows setting or using a higher timeframe."
+            )
+            return
+        if usable_rows < rows:
+            self.llm_output.append(
+                f"<b>[ML Training]</b> Only {usable_rows} rows available for training after indicator calculation. Proceeding with available data."
+            )
         try:
-            df_hist = self.add_technical_indicators(df_hist, min_rows=rows)
+            df_hist = self.add_technical_indicators(df_hist, min_rows=usable_rows)
         except ValueError as e:
             self.llm_output.setHtml(f"<b>[ML Training]</b> {e}")
             return
@@ -726,81 +629,100 @@ Do NOT provide trading recommendations, entry/exit prices, or any rationale for 
         return html
 
     def download_historical_data(self):
-        """
-        Automatically download all historical data for the selected symbol (from pair input)
-        for the past 90 days (1d timeframe, 90 rows), then automatically train the model.
-        """
+        rows = 1000
         custom = self.select_pair_button.text().strip().upper()
         if not custom:
             self.llm_output.setHtml("<b>[Download]</b> Please enter a symbol (e.g., BTC) in the Pair field.")
             return
         symbol = f"{custom}/USDT"
-        # Map UI timeframes to OKX valid bars
-        tf_map = {
-            "5m": "5m",
-            "15m": "15m",
-            "30m": "30m",
-            "1h": "1H",
-            "4h": "4H",
-            "1d": "1D",
-            "1w": "1W",
-            "1m": "1m",
-            "3m": "3m",
-            "1M": "1M",
-        }
-        timeframe = "1d"
-        fetch_tf = tf_map.get(timeframe, timeframe)
-        rows = 90
+        timeframe = self.timeframe_combo.currentText()
+        norm_timeframe = self.timeframe_map.get(timeframe, timeframe).lower()  # Normalize to lowercase for CCXT
+        # Add CCXT exchanges to the dialog, including ALL PAIRS options
+        ccxt_exchanges = [f"CCXT:{exch}" for exch in ["binance", "okx", "kraken", "bybit", "kucoin"]]
+        ccxt_all_pairs = [f"CCXT:{exch} (ALL PAIRS)" for exch in ["binance", "okx", "kraken", "bybit", "kucoin"]]
+        exchanges = ["OKX", "Blofin", "MEXC"] + ccxt_exchanges + ccxt_all_pairs + ["Both"]
+        exchange, ok = QInputDialog.getItem(self, "Select Exchange", "Choose exchange to download from:", exchanges, 0, False)
+        if not ok or not exchange:
+            self.llm_output.append("<b>[Download]</b> Download cancelled by user.")
+            return
         self.progress_bar.setMaximum(2)
         self.progress_bar.setValue(0)
         self.progress_bar.setVisible(True)
-        self.progress_bar.setFormat("Downloading 90 days of historical data... %p%")
+        self.progress_bar.setFormat(f"Downloading {rows} rows of historical data... %p%")
         QApplication.processEvents()
-        # Download data
-        ohlcv = fetch_okx_ohlcv(symbol, fetch_tf, limit=rows)
-        if ohlcv:
-            save_ohlcv(symbol, "90d", ohlcv)
-            self.progress_bar.setValue(1)
+        results = []
+        # Use generic fetch_ohlcv for all exchanges
+        exch_list = [ex for ex in exchanges if ex != "Both"] if exchange == "Both" else [exchange]
+        for exch in exch_list:
+            use_ws = (exch == "Blofin")
+            # Handle CCXT ALL PAIRS batch download
+            if exch.startswith("CCXT:") and "(ALL PAIRS)" in exch:
+                ccxt_name = exch.split(":", 1)[1].split()[0]
+                from Data.ccxt_public_data import fetch_ccxt_ohlcv_all_pairs
+                all_ohlcv = fetch_ccxt_ohlcv_all_pairs(ccxt_name, norm_timeframe, rows)
+                total_pairs = len(all_ohlcv)
+                self.progress_bar.setMaximum(total_pairs)
+                for idx, (pair, ohlcv) in enumerate(all_ohlcv.items(), 1):
+                    if ohlcv:
+                        save_ohlcv(pair, norm_timeframe, ohlcv)
+                        self.llm_output.append(f"<b>[Download]</b> Downloaded {len(ohlcv)} rows for {pair} ({norm_timeframe}) from {exch}.")
+                        results.append((exch, ohlcv))
+                    else:
+                        self.llm_output.append(f"<b>[Download]</b> Failed to download historical data for {pair} ({norm_timeframe}) from {exch}.")
+                    self.progress_bar.setValue(idx)
+                    QApplication.processEvents()
+                continue
+            # Handle single CCXT pair
+            if exch.startswith("CCXT:"):
+                ccxt_name = exch.split(":", 1)[1].split()[0]
+                from Data.ccxt_public_data import fetch_ccxt_ohlcv
+                ohlcv = fetch_ccxt_ohlcv(ccxt_name, symbol, norm_timeframe, rows)
+                if ohlcv:
+                    save_ohlcv(symbol, norm_timeframe, ohlcv)
+                    self.llm_output.append(f"<b>[Download]</b> Downloaded {len(ohlcv)} rows for {symbol} ({norm_timeframe}) from {exch}. Starting training...")
+                    results.append((exch, ohlcv))
+                else:
+                    self.llm_output.append(f"<b>[Download]</b> Failed to download historical data for {symbol} ({norm_timeframe}) from {exch}.")
+                self.progress_bar.setValue(self.progress_bar.value() + 1)
+                QApplication.processEvents()
+                continue
+            ohlcv = fetch_ohlcv(exch, symbol, norm_timeframe, limit=rows, use_ws=use_ws)
+            if ohlcv:
+                save_ohlcv(symbol, norm_timeframe, ohlcv)
+                self.llm_output.append(f"<b>[Download]</b> Downloaded {len(ohlcv)} rows for {symbol} ({norm_timeframe}) from {exch}. Starting training...")
+                results.append((exch, ohlcv))
+            else:
+                self.llm_output.append(f"<b>[Download]</b> Failed to download historical data for {symbol} ({norm_timeframe}) from {exch}.")
+            self.progress_bar.setValue(self.progress_bar.value() + 1)
             QApplication.processEvents()
-            self.llm_output.append(f"<b>[Download]</b> Downloaded {len(ohlcv)} rows for {symbol} (90d). Starting training...")
-        else:
-            self.progress_bar.setVisible(False)
-            self.llm_output.setHtml(f"<b>[Download]</b> Failed to download historical data for {symbol} (90d). Training cancelled.")
-            return
-        # Train model
-        df_hist = load_ohlcv(symbol, "90d")
-        if df_hist.empty or 'close' not in df_hist or df_hist['close'].isnull().all():
-            self.progress_bar.setVisible(False)
-            self.llm_output.setHtml("<b>[ML Training]</b> No valid historical data available for this symbol/timeframe.")
-            return
-        df_hist = df_hist.rename(columns={col: col.lower() for col in df_hist.columns})
-        # Prompt for minimum rows
-        min_rows, ok = QInputDialog.getInt(self, "Minimum Rows Required", "Enter minimum number of valid rows for training:", 35, 10, 500, 1)
-        if not ok:
-            self.llm_output.append("<b>[ML Training]</b> Training cancelled by user (min rows dialog).")
-            return
-        # Ensure at least min_rows after cleaning
-        valid_rows = len(df_hist.dropna(subset=["open", "high", "low", "close", "volume"]))
-        self.llm_output.append(f"<b>[ML Training]</b> Valid rows after cleaning: {valid_rows}")
-        if valid_rows < min_rows:
-            self.progress_bar.setVisible(False)
-            QMessageBox.warning(self, "Not Enough Data", f"Not enough valid data for indicator calculation. At least {min_rows} rows are required after cleaning. Please select a longer timeframe or fetch more data.")
-            self.llm_output.setHtml(f"<b>[ML Training]</b> Not enough valid data for indicator calculation. At least {min_rows} rows are required after cleaning. Valid rows: {valid_rows}")
-            return
-        try:
-            df_hist = self.add_technical_indicators(df_hist, min_rows=min_rows)
-        except ValueError as e:
-            self.progress_bar.setVisible(False)
-            self.llm_output.setHtml(f"<b>[ML Training]</b> {e}")
-            return
-        self.ml_analyzer.set_custom_model_class(None)
-        results = self.ml_analyzer.train_model(df_hist)
+        self.progress_bar.setValue(1)
+        QApplication.processEvents()
+        for exch, ohlcv in results:
+            df_hist = load_ohlcv(symbol, norm_timeframe)
+            if df_hist.empty or 'close' not in df_hist or df_hist['close'].isnull().all():
+                self.progress_bar.setVisible(False)
+                self.llm_output.setHtml(f"<b>[ML Training]</b> No valid historical data available for this symbol/timeframe from {exch}.")
+                continue
+            df_hist = df_hist.rename(columns={col: col.lower() for col in df_hist.columns})
+            valid_rows = len(df_hist.dropna(subset=["open", "high", "low", "close", "volume"]))
+            if valid_rows < rows:
+                self.llm_output.append(
+                    f"<b>[ML Training]</b> Only {valid_rows} rows available for training after indicator calculation from {exch}. Proceeding with available data."
+                )
+            try:
+                df_hist = self.add_technical_indicators(df_hist, min_rows=valid_rows)
+            except ValueError as e:
+                self.progress_bar.setVisible(False)
+                self.llm_output.setHtml(f"<b>[ML Training]</b> {e} ({exch})")
+                continue
+            self.ml_analyzer.set_custom_model_class(None)
+            results_ml = self.ml_analyzer.train_model(df_hist)
+            self.llm_output.append(f"<b>[ML Training]</b> Training complete for {exch}.")
+            self.llm_output.append(self.format_ml_training_result_html(results_ml))
         self.progress_bar.setValue(2)
         self.progress_bar.setVisible(False)
-        self.llm_output.setHtml(self.format_ml_training_result_html(results))
 
     def run_backtest(self):
-        self.update_row_suggestion()
         custom = self.select_pair_button.text().strip().upper()
         if custom:
             symbol = f"{custom}/USDT"
@@ -808,28 +730,16 @@ Do NOT provide trading recommendations, entry/exit prices, or any rationale for 
             self.llm_output.setHtml("<b>[Backtest]</b> Please enter a symbol (e.g., BTC) in the Pair field.")
             return
         timeframe = self.timeframe_combo.currentText()
-        rows = self.rows_spinbox.value()
-        tf_map = {
-            "5m": "5m",
-            "15m": "15m",
-            "30m": "30m",
-            "1h": "1H",
-            "4h": "4H",
-            "1d": "1D",
-            "1w": "1W",
-            "1m": "1m",
-            "3m": "3m",
-            "1M": "1M",
-        }
-        fetch_tf = tf_map.get(timeframe, timeframe)
-        df_hist = load_ohlcv(symbol, fetch_tf)
-        # If not enough rows, try to fetch more
-        if df_hist.shape[0] < rows:
-            from Data.okx_public_data import fetch_okx_ohlcv
-            ohlcv = fetch_okx_ohlcv(symbol, fetch_tf, limit=rows)
-            if ohlcv:
-                save_ohlcv(symbol, fetch_tf, ohlcv)
-                df_hist = load_ohlcv(symbol, fetch_tf)
+        norm_timeframe = self.timeframe_map.get(timeframe, timeframe)
+        rows = 1000
+        exchange = getattr(self, 'selected_exchange', 'OKX')
+        use_ws = (exchange == "Blofin")
+        ohlcv = fetch_ohlcv(exchange, symbol, norm_timeframe, limit=rows, use_ws=use_ws)
+        if ohlcv:
+            save_ohlcv(symbol, norm_timeframe, ohlcv)
+            df_hist = load_ohlcv(symbol, norm_timeframe)
+        else:
+            df_hist = load_ohlcv(symbol, norm_timeframe)
         if df_hist.empty:
             self.llm_output.setHtml("<b>[Backtest]</b> No historical data available for this symbol/timeframe.")
             return
@@ -844,7 +754,6 @@ Do NOT provide trading recommendations, entry/exit prices, or any rationale for 
             strategy_fn = buy_and_hold_strategy
         else:
             strategy_fn = None
-        # Ensure MLAnalyzer uses the selected algorithm
         if self.ml_analyzer.algorithm != self.selected_algorithm:
             self.on_algorithm_changed(self.selected_algorithm)
         results = self.ml_analyzer.backtest(df_hist, strategy=strategy_fn)
@@ -925,7 +834,6 @@ Do NOT provide trading recommendations, entry/exit prices, or any rationale for 
         import config
         config.ML_ALGORITHM = algorithm  # Update global config
         self.ml_analyzer = MLAnalyzer()  # Recreate analyzer with new config
-        self.update_row_suggestion()
 
     def get_current_symbol(self) -> str:
         return self.select_pair_button.text().strip().upper()
@@ -957,7 +865,33 @@ Do NOT provide trading recommendations, entry/exit prices, or any rationale for 
             self.ticker_fetcher.wait()
         super().closeEvent(event)
 
+    def get_ccxt_pairs(self, exchange_name: str) -> set:
+        if not hasattr(self, 'ccxt_pair_cache'):
+            self.ccxt_pair_cache = {}
+        if exchange_name in self.ccxt_pair_cache:
+            return self.ccxt_pair_cache[exchange_name]
+        try:
+            import ccxt
+            exchange_class = getattr(ccxt, exchange_name.lower())
+            exchange = exchange_class()
+            markets = exchange.load_markets()
+            pairs = set(s for s in markets if s.endswith('/USDT'))
+            self.ccxt_pair_cache[exchange_name] = pairs
+            return pairs
+        except Exception as e:
+            error_set = set([f"Error loading CCXT pairs: {e}"])
+            self.ccxt_pair_cache[exchange_name] = error_set
+            return error_set
+
     def show_pair_menu(self):
+        # Toggle: If the menu is already open, close it
+        if hasattr(self, 'pair_menu_widget') and self.pair_menu_widget is not None:
+            self.centralWidget().layout().removeWidget(self.pair_menu_widget)
+            self.pair_menu_widget.deleteLater()
+            self.pair_menu_widget = None
+            self.data_table.setVisible(True)
+            return
+
         from Data.okx_public_data import fetch_okx_ticker
         from Data.blofin_oublic_data import fetch_blofin_instruments, get_blofin_spot_pairs_via_ws
         # Hide the data table
@@ -972,8 +906,9 @@ Do NOT provide trading recommendations, entry/exit prices, or any rationale for 
         self.pair_list = QListWidget()
         layout.addWidget(QLabel("Select a Pair:"))
         layout.addWidget(self.pair_list)
+        self.ccxt_exchanges = ["binance", "okx", "kraken", "bybit", "kucoin"]
         self.exchange_combo = QComboBox()
-        self.exchange_combo.addItems(["All", "OKX", "Blofin"])
+        self.exchange_combo.addItems(["All", "OKX", "Blofin", "MEXC"] + [f"CCXT:{exch}" for exch in self.ccxt_exchanges])
         layout.addWidget(QLabel("Exchange:"))
         layout.addWidget(self.exchange_combo)
         self.pair_menu_widget.setLayout(layout)
@@ -1011,22 +946,61 @@ Do NOT provide trading recommendations, entry/exit prices, or any rationale for 
                             blofin_pairs.add(f"{base}/USDT")
             except Exception as e:
                 blofin_pairs = set([f"Error loading Blofin pairs: {e}"])
-        # Merge and mark source
-        all_pairs = sorted(okx_pairs | blofin_pairs)
+        # Fetch MEXC pairs
+        try:
+            import requests
+            resp = requests.get("https://api.mexc.com/api/v3/exchangeInfo", timeout=10)
+            resp.raise_for_status()
+            data = resp.json()
+            mexc_pairs = set()
+            for s in data.get('symbols', []):
+                if s.get('quoteAsset') == 'USDT' and s.get('status') == 'ENABLED':
+                    mexc_pairs.add(f"{s['baseAsset']}/USDT")
+        except Exception as e:
+            mexc_pairs = set([f"Error loading MEXC pairs: {e}"])
+        # Merge and mark source (do not fetch CCXT pairs here)
+        all_pairs_set = okx_pairs | blofin_pairs | mexc_pairs
         self.pair_sources = {}
-        for p in all_pairs:
+        for p in all_pairs_set:
             srcs = []
             if p in okx_pairs:
                 srcs.append("OKX")
             if p in blofin_pairs:
                 srcs.append("Blofin")
+            if p in mexc_pairs:
+                srcs.append("MEXC")
             self.pair_sources[p] = srcs
-        # Display as: BTC/USDT [OKX,Blofin]
-        self.all_pairs = [f"{p} [{','.join(self.pair_sources[p])}]" for p in all_pairs]
+        # Display as: BTC/USDT [OKX,Blofin,MEXC]
+        self.all_pairs = [f"{p} [{','.join(self.pair_sources[p])}]" for p in sorted(all_pairs_set)]
         self.pair_list.addItems(self.all_pairs)
         self.pair_list.itemClicked.connect(self.select_pair_from_menu)
         self.pair_search_input.textChanged.connect(self.filter_pair_list)
         self.exchange_combo.currentTextChanged.connect(lambda: self.filter_pair_list(self.pair_search_input.text()))
+
+    def filter_pair_list(self, text: str) -> None:
+        if not hasattr(self, 'pair_list') or not hasattr(self, 'all_pairs'):
+            return
+        search_text = text.strip().lower()
+        selected_exchange = self.exchange_combo.currentText() if hasattr(self, 'exchange_combo') else "All"
+        self.pair_list.clear()
+        # If a CCXT exchange is selected, dynamically load its pairs
+        if selected_exchange.startswith("CCXT:"):
+            ccxt_name = selected_exchange.split(":", 1)[1]
+            ccxt_pairs = self.get_ccxt_pairs(ccxt_name)
+            for pair in sorted(ccxt_pairs):
+                if search_text and search_text not in pair.lower():
+                    continue
+                self.pair_list.addItem(f"{pair} [CCXT:{ccxt_name}]")
+            return
+        # Otherwise, filter the preloaded pairs
+        for label in self.all_pairs:
+            pair = label.split('[')[0].strip().lower()
+            srcs = label.split('[')[-1].strip('] ').split(',') if '[' in label else []
+            if search_text and search_text not in pair:
+                continue
+            if selected_exchange != "All" and selected_exchange not in srcs:
+                continue
+            self.pair_list.addItem(label)
 
     def select_pair_from_menu(self, item):
         label = item.text()
@@ -1035,27 +1009,39 @@ Do NOT provide trading recommendations, entry/exit prices, or any rationale for 
             pair, src = label.split("[")
             pair = pair.strip()
             srcs = src.strip("] ").split(",")
-            # Prefer OKX if available, else Blofin
+            # Prefer OKX if available, else Blofin, else MEXC, else CCXT
             if "OKX" in srcs:
                 self.selected_exchange = "OKX"
-            else:
+            elif "Blofin" in srcs:
                 self.selected_exchange = "Blofin"
+            elif "MEXC" in srcs:
+                self.selected_exchange = "MEXC"
+            elif any(s.startswith("CCXT:") for s in srcs):
+                ccxt_src = next(s for s in srcs if s.startswith("CCXT:"))
+                self.selected_exchange = ccxt_src.lower()
+            else:
+                self.selected_exchange = "OKX"
         else:
             pair = label.strip()
-            self.selected_exchange = "OKX"
+            # If the label is from a CCXT dynamic load, set selected_exchange accordingly
+            if "[CCXT:" in label:
+                ccxt_src = label.split("[CCXT:")[-1].strip("] ")
+                self.selected_exchange = f"ccxt:{ccxt_src.lower()}"
+            else:
+                self.selected_exchange = "OKX"
         self.select_pair_button.setText(pair)
         self.selected_pair = pair
         # Remove the menu and restore the data table
         self.centralWidget().layout().removeWidget(self.pair_menu_widget)
         self.pair_menu_widget.deleteLater()
+        self.pair_menu_widget = None  # Ensure reference is cleared
         self.data_table.setVisible(True)
         # Automatically fetch data for the selected pair
         self.fetch_data()
 
     def download_all_timeframes_for_selected_pair(self):
         """
-        Download OHLCV data for all supported timeframes for the selected pair from both OKX (REST) and Blofin (WebSocket), if available.
-        For Blofin, fetch and store all timeframes from '5m' to '1d'.
+        Download at least a month (30 days) of OHLCV data for all supported timeframes for the selected pair from both OKX (REST) and Blofin (WebSocket), if available.
         """
         from Data.okx_public_data import fetch_okx_ohlcv
         from Data.blofin_oublic_data import BlofinWebSocketClient
@@ -1066,11 +1052,22 @@ Do NOT provide trading recommendations, entry/exit prices, or any rationale for 
             return
         okx_timeframes = ["5m", "15m", "30m", "1h", "4h", "1D"]
         blofin_timeframes = ["5m", "15m", "30m", "1h", "4h", "1d"]
-        limits = {"5m": 3000, "15m": 2000, "30m": 1500, "1h": 1000, "4h": 600, "1D": 200, "1d": 200}
+        # Calculate limits for a month (30 days) for each timeframe
+        minutes_per_timeframe = {
+            "5m": 5,
+            "15m": 15,
+            "30m": 30,
+            "1h": 60,
+            "4h": 240,
+            "1D": 1440,
+            "1d": 1440
+        }
+        # 30 days worth of bars for each timeframe
+        bars_per_month = {tf: max(30, int((30*24*60)//minutes_per_timeframe[tf])) for tf in minutes_per_timeframe}
         self.progress_bar.setVisible(True)
         self.progress_bar.setMaximum(len(okx_timeframes) + len(blofin_timeframes))
         self.progress_bar.setValue(0)
-        self.progress_bar.setFormat("Downloading all timeframes (OKX & Blofin)... %p%")
+        self.progress_bar.setFormat("Downloading a month of all timeframes (OKX & Blofin)... %p%")
         QApplication.processEvents()
         # Ensure pair_sources is initialized
         if not hasattr(self, 'pair_sources'):
@@ -1078,7 +1075,7 @@ Do NOT provide trading recommendations, entry/exit prices, or any rationale for 
         # Download from OKX if supported
         if "OKX" in self.pair_sources.get(pair, []):
             for tf in okx_timeframes:
-                limit = limits.get(tf, 100)
+                limit = bars_per_month.get(tf, 30)
                 self.llm_output.append(f"<b>[Download]</b> Downloading {limit} rows for {pair} ({tf}) from OKX...")
                 QApplication.processEvents()
                 ohlcv = fetch_okx_ohlcv(pair, tf, limit=limit)
@@ -1094,7 +1091,7 @@ Do NOT provide trading recommendations, entry/exit prices, or any rationale for 
             inst_id = pair.replace("/", "-") + "-SPOT" if not pair.endswith("-SPOT") else pair
             ws_client = BlofinWebSocketClient()
             for tf in blofin_timeframes:
-                limit = limits.get(tf, 100)
+                limit = bars_per_month.get(tf, 30)
                 self.llm_output.append(f"<b>[Download]</b> Downloading {limit} rows for {pair} ({tf}) via Blofin WebSocket...")
                 QApplication.processEvents()
                 ohlcv = ws_client.fetch_ohlcv(inst_id, bar=tf, limit=limit, timeout=5.0)
@@ -1106,7 +1103,7 @@ Do NOT provide trading recommendations, entry/exit prices, or any rationale for 
                 self.progress_bar.setValue(self.progress_bar.value() + 1)
                 QApplication.processEvents()
         self.progress_bar.setVisible(False)
-        self.llm_output.append(f"<b>[Download]</b> All timeframes downloaded for {pair} (OKX & Blofin).")
+        self.llm_output.append(f"<b>[Download]</b> A month of all timeframes downloaded for {pair} (OKX & Blofin).")
 
     def refresh_data_timestamp(self):
         if self.last_data_fetch_time:
