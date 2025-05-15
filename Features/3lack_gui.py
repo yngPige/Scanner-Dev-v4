@@ -170,6 +170,9 @@ class MainWindow(QMainWindow):
         # Add Current section for real-time data
         self.current_label = QLabel("<b>Current:</b> --")
         self.current_label.setTextFormat(Qt.TextFormat.RichText)
+        # Add reversal indicator label
+        self.reversal_label = QLabel("Reversal: --")
+        self.reversal_label.setStyleSheet("font-weight: bold; font-size: 16px;")
 
         # Data Timestamp Label
         self.data_timestamp_label = QLabel("<b>Last Data Fetch:</b> --")
@@ -189,6 +192,7 @@ class MainWindow(QMainWindow):
         main_layout.addWidget(self.optuna_dashboard_button)
         main_layout.addWidget(self.test_api_button)
         main_layout.addWidget(self.current_label)
+        main_layout.addWidget(self.reversal_label)  # Add reversal label to layout
         main_layout.addWidget(QLabel("Analysis & Recommendations:"))
         main_layout.addWidget(self.llm_output)
 
@@ -234,11 +238,17 @@ class MainWindow(QMainWindow):
 
     def fetch_data(self):
         self.update_exchange_status()
-        symbol = self.select_pair_button.text().strip().upper()
+        # Use the actual selected_pair for CCXT, else construct symbol as before
+        if self.selected_exchange.lower().startswith("ccxt:"):
+            symbol = self.selected_pair
+        else:
+            symbol = self.select_pair_button.text().strip().upper()
         if not symbol or symbol == "SELECT PAIR":
             self.data_table.setRowCount(0)
             self.data_table.setVisible(False)
             self.llm_output.setText("Please select a pair.")
+            self.reversal_label.setText("Reversal: --")
+            self.reversal_label.setStyleSheet("color: black; font-weight: bold; font-size: 16px;")
             return
         timeframe = self.timeframe_combo.currentText()
         norm_timeframe = self.timeframe_map.get(timeframe, timeframe)
@@ -296,10 +306,23 @@ class MainWindow(QMainWindow):
             self.llm_output.setText("")
             self.last_data_fetch_time = datetime.now(timezone.utc)
             self.refresh_data_timestamp()
+            # --- Reversal indicator update ---
+            reversal = self.detect_reversal(ohlcv)
+            if reversal == 'bullish':
+                self.reversal_label.setText("Reversal: Bullish")
+                self.reversal_label.setStyleSheet("color: green; font-weight: bold; font-size: 16px;")
+            elif reversal == 'bearish':
+                self.reversal_label.setText("Reversal: Bearish")
+                self.reversal_label.setStyleSheet("color: red; font-weight: bold; font-size: 16px;")
+            else:
+                self.reversal_label.setText("Reversal: --")
+                self.reversal_label.setStyleSheet("color: black; font-weight: bold; font-size: 16px;")
         else:
             self.data_table.setRowCount(0)
             self.data_table.setVisible(False)
             self.llm_output.setText("Failed to fetch OHLCV data. Please check the symbol, timeframe, or your internet connection.")
+            self.reversal_label.setText("Reversal: --")
+            self.reversal_label.setStyleSheet("color: black; font-weight: bold; font-size: 16px;")
 
     def run_analysis(self):
         """Run analysis using MLAnalyzer only."""
@@ -631,10 +654,11 @@ Do NOT provide trading recommendations, entry/exit prices, or any rationale for 
     def download_historical_data(self):
         rows = 1000
         custom = self.select_pair_button.text().strip().upper()
-        if not custom:
-            self.llm_output.setHtml("<b>[Download]</b> Please enter a symbol (e.g., BTC) in the Pair field.")
-            return
-        symbol = f"{custom}/USDT"
+        # Use the actual selected_pair for CCXT, else construct symbol as before
+        if hasattr(self, 'selected_exchange') and self.selected_exchange.lower().startswith("ccxt:"):
+            symbol = self.selected_pair
+        else:
+            symbol = f"{custom}/USDT"
         timeframe = self.timeframe_combo.currentText()
         norm_timeframe = self.timeframe_map.get(timeframe, timeframe).lower()  # Normalize to lowercase for CCXT
         # Add CCXT exchanges to the dialog, including ALL PAIRS options
@@ -676,13 +700,15 @@ Do NOT provide trading recommendations, entry/exit prices, or any rationale for 
             if exch.startswith("CCXT:"):
                 ccxt_name = exch.split(":", 1)[1].split()[0]
                 from Data.ccxt_public_data import fetch_ccxt_ohlcv
-                ohlcv = fetch_ccxt_ohlcv(ccxt_name, symbol, norm_timeframe, rows)
+                # Use the actual selected_pair for CCXT
+                ccxt_symbol = self.selected_pair if hasattr(self, 'selected_pair') else symbol
+                ohlcv = fetch_ccxt_ohlcv(ccxt_name, ccxt_symbol, norm_timeframe, rows)
                 if ohlcv:
-                    save_ohlcv(symbol, norm_timeframe, ohlcv)
-                    self.llm_output.append(f"<b>[Download]</b> Downloaded {len(ohlcv)} rows for {symbol} ({norm_timeframe}) from {exch}. Starting training...")
+                    save_ohlcv(ccxt_symbol, norm_timeframe, ohlcv)
+                    self.llm_output.append(f"<b>[Download]</b> Downloaded {len(ohlcv)} rows for {ccxt_symbol} ({norm_timeframe}) from {exch}. Starting training...")
                     results.append((exch, ohlcv))
                 else:
-                    self.llm_output.append(f"<b>[Download]</b> Failed to download historical data for {symbol} ({norm_timeframe}) from {exch}.")
+                    self.llm_output.append(f"<b>[Download]</b> Failed to download historical data for {ccxt_symbol} ({norm_timeframe}) from {exch}.")
                 self.progress_bar.setValue(self.progress_bar.value() + 1)
                 QApplication.processEvents()
                 continue
@@ -1021,16 +1047,18 @@ Do NOT provide trading recommendations, entry/exit prices, or any rationale for 
                 self.selected_exchange = ccxt_src.lower()
             else:
                 self.selected_exchange = "OKX"
+            self.selected_pair = pair  # Store the actual symbol as shown in CCXT or other exchanges
         else:
             pair = label.strip()
             # If the label is from a CCXT dynamic load, set selected_exchange accordingly
             if "[CCXT:" in label:
                 ccxt_src = label.split("[CCXT:")[-1].strip("] ")
                 self.selected_exchange = f"ccxt:{ccxt_src.lower()}"
+                self.selected_pair = pair  # Store the actual symbol
             else:
                 self.selected_exchange = "OKX"
+                self.selected_pair = pair
         self.select_pair_button.setText(pair)
-        self.selected_pair = pair
         # Remove the menu and restore the data table
         self.centralWidget().layout().removeWidget(self.pair_menu_widget)
         self.pair_menu_widget.deleteLater()
@@ -1122,6 +1150,22 @@ Do NOT provide trading recommendations, entry/exit prices, or any rationale for 
             return
         launch_optuna_dashboard(storage, port)
         self.llm_output.append(f"<b>[Optuna]</b> Dashboard launched at <a href='http://localhost:{port}'>http://localhost:{port}</a> for storage: {storage}")
+
+    def detect_reversal(self, ohlcv: list) -> str:
+        """
+        Simple reversal detection using last 3 candles (bullish/bearish engulfing).
+        Returns: 'bullish', 'bearish', or 'none'
+        """
+        if len(ohlcv) < 3:
+            return 'none'
+        prev2, prev1, last = ohlcv[-3], ohlcv[-2], ohlcv[-1]
+        # Bullish engulfing: last close > last open, last open < prev1 close, last close > prev1 open
+        if last[4] > last[1] and last[1] < prev1[4] and last[4] > prev1[1]:
+            return 'bullish'
+        # Bearish engulfing: last close < last open, last open > prev1 close, last close < prev1 open
+        if last[4] < last[1] and last[1] > prev1[4] and last[4] < prev1[1]:
+            return 'bearish'
+        return 'none'
 
 def call_ollama_llm(prompt: str, model: str = "llama2", temperature: float = 0.2, max_tokens: int = 512) -> str:
     """
