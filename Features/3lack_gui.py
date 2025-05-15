@@ -236,13 +236,40 @@ class MainWindow(QMainWindow):
             self.current_label.setText(f"Exchange: OKX | Pair: {self.select_pair_button.text().strip().upper()}")
             self.current_label.setStyleSheet("color: red; font-weight: bold;")
 
+    def get_ccxt_timeframe(self, exchange_name: str, user_timeframe: str) -> str:
+        """
+        Map the user's selected timeframe to the correct CCXT-supported format for the given exchange.
+        """
+        try:
+            import ccxt
+            exchange_class = getattr(ccxt, exchange_name.lower())
+            exchange = exchange_class()
+            tf_map = getattr(exchange, 'timeframes', {})
+            # Try direct match (case-insensitive)
+            for tf in tf_map:
+                if tf.lower() == user_timeframe.lower():
+                    return tf
+            # Try normalized (e.g., '1H' -> '1h')
+            norm = user_timeframe.lower()
+            if norm in tf_map:
+                return norm
+            # Fallback: return first available
+            if tf_map:
+                return list(tf_map.keys())[0]
+        except Exception as e:
+            pass
+        return user_timeframe  # fallback to user input if all else fails
+
     def fetch_data(self):
         self.update_exchange_status()
         # Use the actual selected_pair for CCXT, else construct symbol as before
         if self.selected_exchange.lower().startswith("ccxt:"):
             symbol = self.selected_pair
+            ccxt_name = self.selected_exchange.split(":", 1)[1]
+            norm_timeframe = self.get_ccxt_timeframe(ccxt_name, self.timeframe_combo.currentText())
         else:
             symbol = self.select_pair_button.text().strip().upper()
+            norm_timeframe = self.timeframe_map.get(self.timeframe_combo.currentText(), self.timeframe_combo.currentText())
         if not symbol or symbol == "SELECT PAIR":
             self.data_table.setRowCount(0)
             self.data_table.setVisible(False)
@@ -250,8 +277,6 @@ class MainWindow(QMainWindow):
             self.reversal_label.setText("Reversal: --")
             self.reversal_label.setStyleSheet("color: black; font-weight: bold; font-size: 16px;")
             return
-        timeframe = self.timeframe_combo.currentText()
-        norm_timeframe = self.timeframe_map.get(timeframe, timeframe)
         rows = 1000
         exchange = getattr(self, 'selected_exchange', 'OKX')
         use_ws = (exchange == "Blofin")
@@ -657,10 +682,11 @@ Do NOT provide trading recommendations, entry/exit prices, or any rationale for 
         # Use the actual selected_pair for CCXT, else construct symbol as before
         if hasattr(self, 'selected_exchange') and self.selected_exchange.lower().startswith("ccxt:"):
             symbol = self.selected_pair
+            ccxt_name = self.selected_exchange.split(":", 1)[1]
+            norm_timeframe = self.get_ccxt_timeframe(ccxt_name, self.timeframe_combo.currentText())
         else:
             symbol = f"{custom}/USDT"
-        timeframe = self.timeframe_combo.currentText()
-        norm_timeframe = self.timeframe_map.get(timeframe, timeframe).lower()  # Normalize to lowercase for CCXT
+            norm_timeframe = self.timeframe_map.get(self.timeframe_combo.currentText(), self.timeframe_combo.currentText()).lower()
         # Add CCXT exchanges to the dialog, including ALL PAIRS options
         ccxt_exchanges = [f"CCXT:{exch}" for exch in ["binance", "okx", "kraken", "bybit", "kucoin"]]
         ccxt_all_pairs = [f"CCXT:{exch} (ALL PAIRS)" for exch in ["binance", "okx", "kraken", "bybit", "kucoin"]]
@@ -682,33 +708,35 @@ Do NOT provide trading recommendations, entry/exit prices, or any rationale for 
             # Handle CCXT ALL PAIRS batch download
             if exch.startswith("CCXT:") and "(ALL PAIRS)" in exch:
                 ccxt_name = exch.split(":", 1)[1].split()[0]
+                norm_timeframe_all = self.get_ccxt_timeframe(ccxt_name, self.timeframe_combo.currentText())
                 from Data.ccxt_public_data import fetch_ccxt_ohlcv_all_pairs
-                all_ohlcv = fetch_ccxt_ohlcv_all_pairs(ccxt_name, norm_timeframe, rows)
+                all_ohlcv = fetch_ccxt_ohlcv_all_pairs(ccxt_name, norm_timeframe_all, rows)
                 total_pairs = len(all_ohlcv)
                 self.progress_bar.setMaximum(total_pairs)
                 for idx, (pair, ohlcv) in enumerate(all_ohlcv.items(), 1):
                     if ohlcv:
-                        save_ohlcv(pair, norm_timeframe, ohlcv)
-                        self.llm_output.append(f"<b>[Download]</b> Downloaded {len(ohlcv)} rows for {pair} ({norm_timeframe}) from {exch}.")
+                        save_ohlcv(pair, norm_timeframe_all, ohlcv)
+                        self.llm_output.append(f"<b>[Download]</b> Downloaded {len(ohlcv)} rows for {pair} ({norm_timeframe_all}) from {exch}.")
                         results.append((exch, ohlcv))
                     else:
-                        self.llm_output.append(f"<b>[Download]</b> Failed to download historical data for {pair} ({norm_timeframe}) from {exch}.")
+                        self.llm_output.append(f"<b>[Download]</b> Failed to download historical data for {pair} ({norm_timeframe_all}) from {exch}.")
                     self.progress_bar.setValue(idx)
                     QApplication.processEvents()
                 continue
             # Handle single CCXT pair
             if exch.startswith("CCXT:"):
                 ccxt_name = exch.split(":", 1)[1].split()[0]
+                norm_timeframe_ccxt = self.get_ccxt_timeframe(ccxt_name, self.timeframe_combo.currentText())
                 from Data.ccxt_public_data import fetch_ccxt_ohlcv
                 # Use the actual selected_pair for CCXT
                 ccxt_symbol = self.selected_pair if hasattr(self, 'selected_pair') else symbol
-                ohlcv = fetch_ccxt_ohlcv(ccxt_name, ccxt_symbol, norm_timeframe, rows)
+                ohlcv = fetch_ccxt_ohlcv(ccxt_name, ccxt_symbol, norm_timeframe_ccxt, rows)
                 if ohlcv:
-                    save_ohlcv(ccxt_symbol, norm_timeframe, ohlcv)
-                    self.llm_output.append(f"<b>[Download]</b> Downloaded {len(ohlcv)} rows for {ccxt_symbol} ({norm_timeframe}) from {exch}. Starting training...")
+                    save_ohlcv(ccxt_symbol, norm_timeframe_ccxt, ohlcv)
+                    self.llm_output.append(f"<b>[Download]</b> Downloaded {len(ohlcv)} rows for {ccxt_symbol} ({norm_timeframe_ccxt}) from {exch}. Starting training...")
                     results.append((exch, ohlcv))
                 else:
-                    self.llm_output.append(f"<b>[Download]</b> Failed to download historical data for {ccxt_symbol} ({norm_timeframe}) from {exch}.")
+                    self.llm_output.append(f"<b>[Download]</b> Failed to download historical data for {ccxt_symbol} ({norm_timeframe_ccxt}) from {exch}.")
                 self.progress_bar.setValue(self.progress_bar.value() + 1)
                 QApplication.processEvents()
                 continue
