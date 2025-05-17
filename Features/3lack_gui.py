@@ -10,7 +10,7 @@ import importlib.util
 from typing import Any, List, Optional
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
-    QLabel, QComboBox, QLineEdit, QPushButton, QTextEdit, QTableWidget, QTableWidgetItem, QAbstractItemView, QDoubleSpinBox, QSpinBox, QInputDialog, QMessageBox, QProgressBar, QCompleter, QDialog, QListWidget, QDialogButtonBox
+    QLabel, QComboBox, QLineEdit, QPushButton, QTextEdit, QTableWidget, QTableWidgetItem, QAbstractItemView, QDoubleSpinBox, QSpinBox, QInputDialog, QMessageBox, QProgressBar, QCompleter, QDialog, QListWidget, QDialogButtonBox, QCheckBox
 )
 from PyQt6.QtCore import Qt, QThread, pyqtSignal, QTimer
 from PyQt6.QtGui import QIcon
@@ -27,6 +27,10 @@ from dotenv import load_dotenv
 import os
 import requests
 from src.analysis.ml import MLAnalyzer, launch_optuna_dashboard
+from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
+import matplotlib.pyplot as plt
+import matplotlib.dates as mdates
+from mplfinance.original_flavor import candlestick_ohlc
 
 load_dotenv()
 
@@ -50,7 +54,6 @@ class MainWindow(QMainWindow):
 
     def __init__(self):
         super().__init__()
-        self.setWindowIcon(QIcon("assets/icon.png"))
         self.setWindowTitle("3lacks Trading Terminal")
         self.setGeometry(100, 100, 900, 700)
         self.selected_algorithm = "RandomForest"  # Default
@@ -178,6 +181,18 @@ class MainWindow(QMainWindow):
         self.data_timestamp_label = QLabel("<b>Last Data Fetch:</b> --")
         self.data_timestamp_label.setTextFormat(Qt.TextFormat.RichText)
         main_layout.addWidget(self.data_timestamp_label)
+
+        # Add Matplotlib FigureCanvas for chart visualization (initially hidden)
+        self.figure = plt.Figure(figsize=(10, 5))
+        self.canvas = FigureCanvas(self.figure)
+        self.canvas.setVisible(False)
+        # Add a checkbox to toggle chart visibility
+        self.show_chart_checkbox = QCheckBox("Show Chart")
+        self.show_chart_checkbox.setChecked(False)
+        self.show_chart_checkbox.stateChanged.connect(self.toggle_chart_visibility)
+        # Add to layout
+        main_layout.addWidget(self.show_chart_checkbox)
+        main_layout.addWidget(self.canvas)
 
         # Add widgets to main_layout (after creation)
         main_layout.addLayout(controls_layout)
@@ -372,6 +387,7 @@ class MainWindow(QMainWindow):
         # Only use MLAnalyzer
         self.ml_analyzer.set_custom_model_class(None)
         output = ""
+        ml_result = None
         if self.ml_analyzer.algorithm != self.selected_algorithm:
             self.on_algorithm_changed(self.selected_algorithm)
         if mode in ["Machine Learning", "Both"]:
@@ -390,6 +406,15 @@ class MainWindow(QMainWindow):
                 llm_result = self.llm_analyze_ohlcv(ohlcv_data)
                 output += "[LLM Analysis]\n" + llm_result
         self.llm_output.setHtml(output)
+        # Store last analysis and df for toggle re-plotting
+        self.last_analysis = ml_result if ml_result and isinstance(ml_result, dict) else None
+        self.last_df_hist = df_hist
+        # Plot analysis chart if visible
+        try:
+            if self.show_chart_checkbox.isChecked() and self.last_analysis:
+                self.plot_analysis(self.last_df_hist, self.last_analysis)
+        except Exception as e:
+            print(f"Plotting error: {e}")
 
     @staticmethod
     def get_llm_trader_prompt_template() -> str:
@@ -687,70 +712,39 @@ Do NOT provide trading recommendations, entry/exit prices, or any rationale for 
         else:
             symbol = f"{custom}/USDT"
             norm_timeframe = self.timeframe_map.get(self.timeframe_combo.currentText(), self.timeframe_combo.currentText()).lower()
-        # Add CCXT exchanges to the dialog, including ALL PAIRS options
-        ccxt_exchanges = [f"CCXT:{exch}" for exch in ["binance", "okx", "kraken", "bybit", "kucoin"]]
-        ccxt_all_pairs = [f"CCXT:{exch} (ALL PAIRS)" for exch in ["binance", "okx", "kraken", "bybit", "kucoin"]]
-        exchanges = ["OKX", "Blofin", "MEXC"] + ccxt_exchanges + ccxt_all_pairs + ["Both"]
-        exchange, ok = QInputDialog.getItem(self, "Select Exchange", "Choose exchange to download from:", exchanges, 0, False)
-        if not ok or not exchange:
-            self.llm_output.append("<b>[Download]</b> Download cancelled by user.")
-            return
-        self.progress_bar.setMaximum(2)
+        self.progress_bar.setMaximum(1)
         self.progress_bar.setValue(0)
         self.progress_bar.setVisible(True)
         self.progress_bar.setFormat(f"Downloading {rows} rows of historical data... %p%")
         QApplication.processEvents()
         results = []
-        # Use generic fetch_ohlcv for all exchanges
-        exch_list = [ex for ex in exchanges if ex != "Both"] if exchange == "Both" else [exchange]
-        for exch in exch_list:
-            use_ws = (exch == "Blofin")
-            # Handle CCXT ALL PAIRS batch download
-            if exch.startswith("CCXT:") and "(ALL PAIRS)" in exch:
-                ccxt_name = exch.split(":", 1)[1].split()[0]
-                norm_timeframe_all = self.get_ccxt_timeframe(ccxt_name, self.timeframe_combo.currentText())
-                from Data.ccxt_public_data import fetch_ccxt_ohlcv_all_pairs
-                all_ohlcv = fetch_ccxt_ohlcv_all_pairs(ccxt_name, norm_timeframe_all, rows)
-                total_pairs = len(all_ohlcv)
-                self.progress_bar.setMaximum(total_pairs)
-                for idx, (pair, ohlcv) in enumerate(all_ohlcv.items(), 1):
-                    if ohlcv:
-                        save_ohlcv(pair, norm_timeframe_all, ohlcv)
-                        self.llm_output.append(f"<b>[Download]</b> Downloaded {len(ohlcv)} rows for {pair} ({norm_timeframe_all}) from {exch}.")
-                        results.append((exch, ohlcv))
-                    else:
-                        self.llm_output.append(f"<b>[Download]</b> Failed to download historical data for {pair} ({norm_timeframe_all}) from {exch}.")
-                    self.progress_bar.setValue(idx)
-                    QApplication.processEvents()
-                continue
-            # Handle single CCXT pair
-            if exch.startswith("CCXT:"):
-                ccxt_name = exch.split(":", 1)[1].split()[0]
-                norm_timeframe_ccxt = self.get_ccxt_timeframe(ccxt_name, self.timeframe_combo.currentText())
-                from Data.ccxt_public_data import fetch_ccxt_ohlcv
-                # Use the actual selected_pair for CCXT
-                ccxt_symbol = self.selected_pair if hasattr(self, 'selected_pair') else symbol
-                ohlcv = fetch_ccxt_ohlcv(ccxt_name, ccxt_symbol, norm_timeframe_ccxt, rows)
-                if ohlcv:
-                    save_ohlcv(ccxt_symbol, norm_timeframe_ccxt, ohlcv)
-                    self.llm_output.append(f"<b>[Download]</b> Downloaded {len(ohlcv)} rows for {ccxt_symbol} ({norm_timeframe_ccxt}) from {exch}. Starting training...")
-                    results.append((exch, ohlcv))
-                else:
-                    self.llm_output.append(f"<b>[Download]</b> Failed to download historical data for {ccxt_symbol} ({norm_timeframe_ccxt}) from {exch}.")
-                self.progress_bar.setValue(self.progress_bar.value() + 1)
-                QApplication.processEvents()
-                continue
-            ohlcv = fetch_ohlcv(exch, symbol, norm_timeframe, limit=rows, use_ws=use_ws)
+        exchange = getattr(self, 'selected_exchange', 'OKX')
+        use_ws = (exchange == "Blofin")
+        # Handle CCXT ALL PAIRS batch download (not supported in this single-pair mode)
+        if exchange.lower().startswith("ccxt:"):
+            ccxt_name = exchange.split(":", 1)[1]
+            norm_timeframe_ccxt = self.get_ccxt_timeframe(ccxt_name, self.timeframe_combo.currentText())
+            from Data.ccxt_public_data import fetch_ccxt_ohlcv
+            ccxt_symbol = self.selected_pair if hasattr(self, 'selected_pair') else symbol
+            ohlcv = fetch_ccxt_ohlcv(ccxt_name, ccxt_symbol, norm_timeframe_ccxt, rows)
             if ohlcv:
-                save_ohlcv(symbol, norm_timeframe, ohlcv)
-                self.llm_output.append(f"<b>[Download]</b> Downloaded {len(ohlcv)} rows for {symbol} ({norm_timeframe}) from {exch}. Starting training...")
-                results.append((exch, ohlcv))
+                save_ohlcv(ccxt_symbol, norm_timeframe_ccxt, ohlcv)
+                self.llm_output.append(f"<b>[Download]</b> Downloaded {len(ohlcv)} rows for {ccxt_symbol} ({norm_timeframe_ccxt}) from {exchange}. Starting training...")
+                results.append((exchange, ohlcv))
             else:
-                self.llm_output.append(f"<b>[Download]</b> Failed to download historical data for {symbol} ({norm_timeframe}) from {exch}.")
+                self.llm_output.append(f"<b>[Download]</b> Failed to download historical data for {ccxt_symbol} ({norm_timeframe_ccxt}) from {exchange}.")
             self.progress_bar.setValue(self.progress_bar.value() + 1)
             QApplication.processEvents()
-        self.progress_bar.setValue(1)
-        QApplication.processEvents()
+        else:
+            ohlcv = fetch_ohlcv(exchange, symbol, norm_timeframe, limit=rows, use_ws=use_ws)
+            if ohlcv:
+                save_ohlcv(symbol, norm_timeframe, ohlcv)
+                self.llm_output.append(f"<b>[Download]</b> Downloaded {len(ohlcv)} rows for {symbol} ({norm_timeframe}) from {exchange}. Starting training...")
+                results.append((exchange, ohlcv))
+            else:
+                self.llm_output.append(f"<b>[Download]</b> Failed to download historical data for {symbol} ({norm_timeframe}) from {exchange}.")
+            self.progress_bar.setValue(self.progress_bar.value() + 1)
+            QApplication.processEvents()
         for exch, ohlcv in results:
             df_hist = load_ohlcv(symbol, norm_timeframe)
             if df_hist.empty or 'close' not in df_hist or df_hist['close'].isnull().all():
@@ -773,7 +767,7 @@ Do NOT provide trading recommendations, entry/exit prices, or any rationale for 
             results_ml = self.ml_analyzer.train_model(df_hist)
             self.llm_output.append(f"<b>[ML Training]</b> Training complete for {exch}.")
             self.llm_output.append(self.format_ml_training_result_html(results_ml))
-        self.progress_bar.setValue(2)
+        self.progress_bar.setValue(1)
         self.progress_bar.setVisible(False)
 
     def run_backtest(self):
@@ -1195,6 +1189,47 @@ Do NOT provide trading recommendations, entry/exit prices, or any rationale for 
             return 'bearish'
         return 'none'
 
+    def toggle_chart_visibility(self):
+        checked = self.show_chart_checkbox.isChecked()
+        self.canvas.setVisible(checked)
+        # Optionally, re-plot if showing
+        if checked and hasattr(self, 'last_analysis') and hasattr(self, 'last_df_hist'):
+            self.plot_analysis(self.last_df_hist, self.last_analysis)
+
+    def plot_analysis(self, klines_data: pd.DataFrame, analysis: dict) -> None:
+        """
+        Plot OHLCV candlestick chart with ML analysis overlays in the GUI.
+        Only plot if chart is visible.
+        """
+        if not self.show_chart_checkbox.isChecked():
+            return
+        self.figure.clear()
+        ax = self.figure.add_subplot(111)
+        df = klines_data.copy()
+        df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms' if df['timestamp'].max() > 1e10 else 's')
+        df.set_index('timestamp', inplace=True)
+        # Prepare OHLC for mplfinance
+        ohlc = df[['open', 'high', 'low', 'close']].copy()
+        ohlc['date'] = mdates.date2num(df.index)
+        ohlc = ohlc[['date', 'open', 'high', 'low', 'close']].values
+        candlestick_ohlc(ax, ohlc, width=0.6/(len(df)), colorup='g', colordown='r', alpha=0.8)
+        # Plot signals
+        if 'entry_points' in analysis:
+            for entry in analysis['entry_points']:
+                ax.axhline(entry, color='blue', linestyle='--', alpha=0.7, label='Entry')
+        if 'exit_points' in analysis:
+            for tp in analysis['exit_points']:
+                ax.axhline(tp, color='green', linestyle=':', alpha=0.7, label='Take Profit')
+        if 'stop_loss_points' in analysis:
+            for sl in analysis['stop_loss_points']:
+                ax.axhline(sl, color='red', linestyle=':', alpha=0.7, label='Stop Loss')
+        ax.set_title(f"{analysis.get('symbol', '')} {analysis.get('timeframe', '')} - {analysis.get('recommendation', '')}")
+        ax.set_ylabel("Price")
+        ax.xaxis.set_major_formatter(mdates.DateFormatter('%Y-%m-%d %H:%M'))
+        self.figure.autofmt_xdate()
+        ax.legend(loc='upper left')
+        self.canvas.draw()
+
 def call_ollama_llm(prompt: str, model: str = "llama2", temperature: float = 0.2, max_tokens: int = 512) -> str:
     """
     Call the local Ollama LLM API with a prompt and return the response.
@@ -1270,7 +1305,6 @@ def compute_macd(close: pd.Series, fast: int = 12, slow: int = 26, signal: int =
 
 if __name__ == "__main__":
     app = QApplication(sys.argv)
-    app.setWindowIcon(QIcon("assets/icon.png"))
     window = MainWindow()
     window.show()
     sys.exit(app.exec()) 

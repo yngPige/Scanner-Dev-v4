@@ -18,11 +18,7 @@ IF EXIST requirements.txt (
 )
 
 REM Step 3: Check for assets/icon.png
-IF NOT EXIST assets\icon.png (
-    echo [ERROR] assets/icon.png not found! Please add your icon to assets/icon.png before building.
-    pause
-    exit /b 1
-)
+REM (Removed icon check as icon is no longer required)
 
 REM Step 4: Build executable with PyInstaller
 IF NOT EXIST 3lacksScanner.spec (

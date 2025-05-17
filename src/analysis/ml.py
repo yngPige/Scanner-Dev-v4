@@ -328,6 +328,28 @@ class MLAnalyzer:
                 'timestamp': datetime.now().isoformat()
             }
 
+    def _calculate_take_profit(self, entry_price: float, atr: float, direction: str = "long", pct: float = 0.04) -> float:
+        """
+        Calculate take profit price using ATR and/or fixed percentage.
+
+        Args:
+            entry_price (float): The entry or reference price.
+            atr (float): Average True Range value.
+            direction (str): 'long' or 'short'.
+            pct (float): Take profit as a decimal (e.g., 0.04 for 4%).
+
+        Returns:
+            float: Take profit price.
+        """
+        if direction == "long":
+            tp_atr = entry_price + 1.5 * atr
+            tp_pct = entry_price * (1 + pct)
+            return round(max(tp_atr, tp_pct), 4)
+        else:
+            tp_atr = entry_price - 1.5 * atr
+            tp_pct = entry_price * (1 - pct)
+            return round(min(tp_atr, tp_pct), 4)
+
     def _generate_limit_order_recommendations(self, klines_data, recommendation, confidence, support_levels, resistance_levels, current_price):
         """
         Generate limit order recommendations based on analysis results
@@ -387,7 +409,7 @@ class MLAnalyzer:
             confidence_factor = confidence / 100  # 0 to 1
             primary_entry = current_price * (1 - (0.01 * spacing_factor * (1 - confidence_factor)))
             limit_orders["entry"].append({
-                "price": primary_entry,
+                "price": round(primary_entry, 4),
                 "type": "LIMIT",
                 "description": "Primary entry point slightly below current price",
                 "confidence": "HIGH"
@@ -396,43 +418,33 @@ class MLAnalyzer:
                 if support < primary_entry * 0.98:
                     confidence_level = "MEDIUM" if i == 0 else "LOW"
                     limit_orders["entry"].append({
-                        "price": support,
+                        "price": round(support, 4),
                         "type": "LIMIT",
                         "description": f"Support level entry point",
                         "confidence": confidence_level
                     })
-            # Take profit at resistance levels
+            # Take profit: always add robust ATR/percentage-based TP first
+            tp_price = self._calculate_take_profit(primary_entry, atr, direction="long")
+            limit_orders["take_profit"].append({
+                "price": tp_price,
+                "type": "LIMIT",
+                "description": f"Take profit (ATR/percent based)",
+                "confidence": "HIGH"
+            })
+            # Add resistance-based TPs as secondary
             for i, resistance in enumerate(relevant_resistances[:3]):
                 confidence_level = "HIGH" if i == 0 else "MEDIUM" if i == 1 else "LOW"
                 limit_orders["take_profit"].append({
-                    "price": resistance,
+                    "price": round(resistance, 4),
                     "type": "LIMIT",
                     "description": f"Take profit at resistance level",
                     "confidence": confidence_level
                 })
-            # If no resistance levels, use ATR-based and percentage-based take profits
-            if not limit_orders["take_profit"]:
-                for i, mult in enumerate([1.5, 2, 3]):
-                    limit_orders["take_profit"].append({
-                        "price": primary_entry + mult * atr,
-                        "type": "LIMIT",
-                        "description": f"Take profit at {mult} ATR above entry",
-                        "confidence": "MEDIUM" if i == 0 else "LOW"
-                    })
-                for i, pct in enumerate([1.5, 3, 5]):
-                    adjusted_pct = pct * spacing_factor
-                    confidence_level = "HIGH" if i == 0 else "MEDIUM" if i == 1 else "LOW"
-                    limit_orders["take_profit"].append({
-                        "price": primary_entry * (1 + (adjusted_pct / 100)),
-                        "type": "LIMIT",
-                        "description": f"Take profit at {adjusted_pct:.1f}% above entry",
-                        "confidence": confidence_level
-                    })
             # Stop loss below nearest support
             if relevant_supports:
                 stop_price = relevant_supports[0] * (1 - (0.02 * spacing_factor))
                 limit_orders["stop_loss"].append({
-                    "price": stop_price,
+                    "price": round(stop_price, 4),
                     "type": "STOP",
                     "description": "Stop loss below nearest support level",
                     "confidence": "HIGH"
@@ -440,7 +452,7 @@ class MLAnalyzer:
             else:
                 stop_price = primary_entry - (0.05 * spacing_factor * primary_entry)
                 limit_orders["stop_loss"].append({
-                    "price": stop_price,
+                    "price": round(stop_price, 4),
                     "type": "STOP",
                     "description": f"Stop loss at {(0.05 * spacing_factor) * 100:.1f}% below entry",
                     "confidence": "MEDIUM"
@@ -450,7 +462,7 @@ class MLAnalyzer:
             confidence_factor = confidence / 100  # 0 to 1
             primary_entry = current_price * (1 + (0.01 * spacing_factor * (1 - confidence_factor)))
             limit_orders["entry"].append({
-                "price": primary_entry,
+                "price": round(primary_entry, 4),
                 "type": "LIMIT",
                 "description": "Primary entry point slightly above current price",
                 "confidence": "HIGH"
@@ -459,43 +471,33 @@ class MLAnalyzer:
                 if resistance > primary_entry * 1.02:
                     confidence_level = "MEDIUM" if i == 0 else "LOW"
                     limit_orders["entry"].append({
-                        "price": resistance,
+                        "price": round(resistance, 4),
                         "type": "LIMIT",
                         "description": f"Resistance level entry point",
                         "confidence": confidence_level
                     })
-            # Take profit at support levels
+            # Take profit: always add robust ATR/percentage-based TP first
+            tp_price = self._calculate_take_profit(primary_entry, atr, direction="short")
+            limit_orders["take_profit"].append({
+                "price": tp_price,
+                "type": "LIMIT",
+                "description": f"Take profit (ATR/percent based)",
+                "confidence": "HIGH"
+            })
+            # Add support-based TPs as secondary
             for i, support in enumerate(relevant_supports[:3]):
                 confidence_level = "HIGH" if i == 0 else "MEDIUM" if i == 1 else "LOW"
                 limit_orders["take_profit"].append({
-                    "price": support,
+                    "price": round(support, 4),
                     "type": "LIMIT",
                     "description": f"Take profit at support level",
                     "confidence": confidence_level
                 })
-            # If no support levels, use ATR-based and percentage-based take profits
-            if not limit_orders["take_profit"]:
-                for i, mult in enumerate([1.5, 2, 3]):
-                    limit_orders["take_profit"].append({
-                        "price": primary_entry - mult * atr,
-                        "type": "LIMIT",
-                        "description": f"Take profit at {mult} ATR below entry",
-                        "confidence": "MEDIUM" if i == 0 else "LOW"
-                    })
-                for i, pct in enumerate([1.5, 3, 5]):
-                    adjusted_pct = pct * spacing_factor
-                    confidence_level = "HIGH" if i == 0 else "MEDIUM" if i == 1 else "LOW"
-                    limit_orders["take_profit"].append({
-                        "price": primary_entry * (1 - (adjusted_pct / 100)),
-                        "type": "LIMIT",
-                        "description": f"Take profit at {adjusted_pct:.1f}% below entry",
-                        "confidence": confidence_level
-                    })
             # Stop loss above nearest resistance
             if relevant_resistances:
                 stop_price = relevant_resistances[0] * (1 + (0.02 * spacing_factor))
                 limit_orders["stop_loss"].append({
-                    "price": stop_price,
+                    "price": round(stop_price, 4),
                     "type": "STOP",
                     "description": "Stop loss above nearest resistance level",
                     "confidence": "HIGH"
@@ -503,7 +505,7 @@ class MLAnalyzer:
             else:
                 stop_price = primary_entry + (0.05 * spacing_factor * primary_entry)
                 limit_orders["stop_loss"].append({
-                    "price": stop_price,
+                    "price": round(stop_price, 4),
                     "type": "STOP",
                     "description": f"Stop loss at {(0.05 * spacing_factor) * 100:.1f}% above entry",
                     "confidence": "MEDIUM"
