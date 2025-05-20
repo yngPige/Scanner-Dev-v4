@@ -11,7 +11,7 @@ import json
 from datetime import datetime
 import joblib
 import os
-from sklearn.ensemble import RandomForestClassifier, GradientBoostingClassifier
+from sklearn.ensemble import RandomForestClassifier, GradientBoostingClassifier, VotingClassifier, StackingClassifier
 from sklearn.svm import SVC
 from sklearn.preprocessing import StandardScaler
 from sklearn.model_selection import train_test_split, GridSearchCV, TimeSeriesSplit
@@ -29,6 +29,7 @@ from optuna import Trial, Study
 from typing import Any, Dict, Optional, Callable
 import matplotlib.pyplot as plt
 import subprocess
+import itertools
 
 warnings.filterwarnings("ignore", category=UserWarning, module="xgboost")
 
@@ -139,16 +140,66 @@ class MLAnalyzer:
                 random_state=42
             )
         elif self.algorithm == "XGBoost":
-            # XGBoost support
             return XGBClassifier(
                 n_estimators=100,
                 learning_rate=0.1,
                 max_depth=3,
                 random_state=42,
-                use_label_encoder=False,
                 eval_metric='logloss',
                 n_jobs=-1
             )
+        elif self.algorithm in ["Ensemble (Voting)", "Ensemble (Stacking)"]:
+            # Build all base models, skip any that fail
+            base_models = []
+            errors = []
+            # Try to instantiate each model, skip if fails
+            try:
+                base_models.append(('rf', RandomForestClassifier(
+                    n_estimators=config.RF_N_ESTIMATORS,
+                    max_depth=config.RF_MAX_DEPTH,
+                    min_samples_split=config.RF_MIN_SAMPLES_SPLIT,
+                    min_samples_leaf=config.RF_MIN_SAMPLES_LEAF,
+                    random_state=config.RF_RANDOM_STATE,
+                    n_jobs=-1)))
+            except Exception as e:
+                errors.append(f"RandomForest: {e}")
+            try:
+                base_models.append(('gb', GradientBoostingClassifier(
+                    n_estimators=100,
+                    learning_rate=0.1,
+                    max_depth=3,
+                    random_state=42)))
+            except Exception as e:
+                errors.append(f"GradientBoosting: {e}")
+            try:
+                base_models.append(('svm', SVC(
+                    kernel='rbf',
+                    C=1.0,
+                    gamma='scale',
+                    probability=True,
+                    random_state=42)))
+            except Exception as e:
+                errors.append(f"SVM: {e}")
+            try:
+                base_models.append(('xgb', XGBClassifier(
+                    n_estimators=100,
+                    learning_rate=0.1,
+                    max_depth=3,
+                    random_state=42,
+                    eval_metric='logloss',
+                    n_jobs=-1)))
+            except Exception as e:
+                errors.append(f"XGBoost: {e}")
+            # Remove any models that failed
+            base_models = [(name, model) for name, model in base_models if model is not None]
+            if not base_models:
+                raise RuntimeError(f"No base models available for ensemble. Errors: {errors}")
+            if self.algorithm == "Ensemble (Voting)":
+                return VotingClassifier(estimators=base_models, voting='soft', n_jobs=-1)
+            else:
+                # Stacking: use LogisticRegression as final estimator
+                from sklearn.linear_model import LogisticRegression
+                return StackingClassifier(estimators=base_models, final_estimator=LogisticRegression(), n_jobs=-1)
         else:
             # Default to RandomForest
             return RandomForestClassifier(
@@ -250,10 +301,68 @@ class MLAnalyzer:
                 'timestamp': datetime.now().isoformat()
             }
         # Step 2: Build pipeline (no indicator adder, no imputer)
-        pipeline = Pipeline([
-            ('scaler', StandardScaler()),
-            ('model', self._create_model())
-        ])
+        if self.algorithm in ["Ensemble (Voting)", "Ensemble (Stacking)"]:
+            # Build all base models, skip any that fail
+            base_models = []
+            errors = []
+            try:
+                base_models.append(('rf', RandomForestClassifier(
+                    n_estimators=config.RF_N_ESTIMATORS,
+                    max_depth=config.RF_MAX_DEPTH,
+                    min_samples_split=config.RF_MIN_SAMPLES_SPLIT,
+                    min_samples_leaf=config.RF_MIN_SAMPLES_LEAF,
+                    random_state=config.RF_RANDOM_STATE,
+                    n_jobs=-1)))
+            except Exception as e:
+                errors.append(f"RandomForest: {e}")
+            try:
+                base_models.append(('gb', GradientBoostingClassifier(
+                    n_estimators=100,
+                    learning_rate=0.1,
+                    max_depth=3,
+                    random_state=42)))
+            except Exception as e:
+                errors.append(f"GradientBoosting: {e}")
+            try:
+                base_models.append(('svm', SVC(
+                    kernel='rbf',
+                    C=1.0,
+                    gamma='scale',
+                    probability=True,
+                    random_state=42)))
+            except Exception as e:
+                errors.append(f"SVM: {e}")
+            try:
+                base_models.append(('xgb', XGBClassifier(
+                    n_estimators=100,
+                    learning_rate=0.1,
+                    max_depth=3,
+                    random_state=42,
+                    eval_metric='logloss',
+                    n_jobs=-1)))
+            except Exception as e:
+                errors.append(f"XGBoost: {e}")
+            # Remove any models that failed
+            base_models = [(name, model) for name, model in base_models if model is not None]
+            if not base_models:
+                return {
+                    'error': f'No base models available for ensemble. Errors: {errors}',
+                    'timestamp': datetime.now().isoformat()
+                }
+            if self.algorithm == "Ensemble (Voting)":
+                model = VotingClassifier(estimators=base_models, voting='soft', n_jobs=-1)
+            else:
+                from sklearn.linear_model import LogisticRegression
+                model = StackingClassifier(estimators=base_models, final_estimator=LogisticRegression(), n_jobs=-1)
+            pipeline = Pipeline([
+                ('scaler', StandardScaler()),
+                ('model', model)
+            ])
+        else:
+            pipeline = Pipeline([
+                ('scaler', StandardScaler()),
+                ('model', self._create_model())
+            ])
         # Step 3: Split and fit
         X_train, X_test, y_train, y_test = train_test_split(X_clean, y_clean, test_size=0.2, random_state=42)
         pipeline.fit(X_train, y_train)
@@ -862,13 +971,20 @@ class MLAnalyzer:
         split_returns = []
         split_drawdowns = []
         split_sharpes = []
+        equity_curve_full = []
+        timestamps_full = []
+        # If klines_data has a timestamp column, use it
+        if 'timestamp' in klines_data.columns:
+            all_timestamps = klines_data[mask]['timestamp'].values
+        else:
+            all_timestamps = np.arange(len(X_clean))
         for split_idx, (train_idx, test_idx) in enumerate(tscv.split(X_clean)):
             X_train, X_test = X_clean.iloc[train_idx], X_clean.iloc[test_idx]
             y_train, y_test = y_clean.iloc[train_idx], y_clean.iloc[test_idx]
             prices_test = close_prices[test_idx]
+            split_timestamps = all_timestamps[test_idx]
             if strategy is not None:
                 y_pred = strategy(X_test)
-                # If strategy returns -1 for hold, treat as no position (flat)
                 y_pred = np.where(y_pred == -1, 0, y_pred)
             else:
                 pipeline = Pipeline([
@@ -908,6 +1024,11 @@ class MLAnalyzer:
                     balance -= abs(pnl) * fee
                     position = 0
                 equity_curve.append(balance)
+            # For equity curve output, align with timestamps
+            # The first equity is before the first test bar, so skip it for plotting
+            equity_curve_split = equity_curve[1:]
+            equity_curve_full.extend(equity_curve_split)
+            timestamps_full.extend(split_timestamps)
             returns = np.diff(equity_curve)
             cum_return = (equity_curve[-1] - initial_balance) / initial_balance
             max_drawdown = 0
@@ -946,6 +1067,11 @@ class MLAnalyzer:
         results['mean_cumulative_return'] = float(np.mean(split_returns)) if split_returns else 0.0
         results['mean_max_drawdown'] = float(np.mean(split_drawdowns)) if split_drawdowns else 0.0
         results['mean_sharpe'] = float(np.mean(split_sharpes)) if split_sharpes else 0.0
+        # Add equity curve for plotting/saving
+        results['equity_curve'] = [
+            {'timestamp': int(ts), 'equity': float(eq)}
+            for ts, eq in zip(timestamps_full, equity_curve_full)
+        ]
         return results
 
     def backtest_limit_orders(self, klines_data: pd.DataFrame, fee: float = 0.001) -> dict:
@@ -1063,7 +1189,6 @@ class MLAnalyzer:
                     max_depth=max_depth,
                     learning_rate=learning_rate,
                     random_state=42,
-                    use_label_encoder=False,
                     eval_metric='logloss',
                     n_jobs=-1
                 )
@@ -1120,6 +1245,65 @@ class MLAnalyzer:
         )
         study.optimize(objective, n_trials=n_trials, show_progress_bar=show_progress_bar)
         return study
+
+    def parameter_sweep_backtest(
+        self,
+        klines_data: pd.DataFrame,
+        param_grid: dict,
+        n_splits: int = 5,
+        initial_balance: float = 10000.0,
+        fee: float = 0.001,
+        strategy: Optional[Callable[[pd.DataFrame], np.ndarray]] = None
+    ) -> pd.DataFrame:
+        """
+        Run backtest over a grid of parameters and return a DataFrame of results.
+
+        Args:
+            klines_data (pd.DataFrame): Historical price data.
+            param_grid (dict): Dictionary of parameter lists, e.g. {'fee': [0.001, 0.002], 'n_splits': [3, 5]}.
+            n_splits (int): Default number of splits.
+            initial_balance (float): Default starting balance.
+            fee (float): Default trading fee.
+            strategy (Optional[Callable]): Optional strategy function.
+
+        Returns:
+            pd.DataFrame: DataFrame with one row per parameter combination and backtest results.
+        """
+        # Prepare all combinations of parameters
+        keys, values = zip(*param_grid.items())
+        param_combos = [dict(zip(keys, v)) for v in itertools.product(*values)]
+        results = []
+        for params in param_combos:
+            # Use provided params or defaults
+            ns = params.get('n_splits', n_splits)
+            bal = params.get('initial_balance', initial_balance)
+            f = params.get('fee', fee)
+            # Optionally, pass params to strategy if it supports them
+            try:
+                res = self.backtest(
+                    klines_data=klines_data,
+                    n_splits=ns,
+                    initial_balance=bal,
+                    fee=f,
+                    strategy=strategy
+                )
+                # Flatten results for DataFrame
+                flat = {**params}
+                flat.update({
+                    'accuracy': res.get('accuracy'),
+                    'f1': res.get('f1'),
+                    'precision': res.get('precision'),
+                    'recall': res.get('recall'),
+                    'mean_cumulative_return': res.get('mean_cumulative_return'),
+                    'mean_max_drawdown': res.get('mean_max_drawdown'),
+                    'mean_sharpe': res.get('mean_sharpe'),
+                    'error': res.get('error', None)
+                })
+                results.append(flat)
+            except Exception as e:
+                flat = {**params, 'error': str(e)}
+                results.append(flat)
+        return pd.DataFrame(results)
 
 def format_ml_training_result(result: dict) -> str:
     lines = []

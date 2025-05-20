@@ -10,13 +10,12 @@ import importlib.util
 from typing import Any, List, Optional
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
-    QLabel, QComboBox, QLineEdit, QPushButton, QTextEdit, QTableWidget, QTableWidgetItem, QAbstractItemView, QDoubleSpinBox, QSpinBox, QInputDialog, QMessageBox, QProgressBar, QCompleter, QDialog, QListWidget, QDialogButtonBox, QCheckBox
+    QLabel, QComboBox, QLineEdit, QPushButton, QTextEdit, QTableWidget, QTableWidgetItem, QAbstractItemView, QDoubleSpinBox, QSpinBox, QInputDialog, QMessageBox, QProgressBar, QCompleter, QDialog, QListWidget, QDialogButtonBox, QCheckBox, QTabWidget, QScrollArea, QToolButton
 )
-from PyQt6.QtCore import Qt, QThread, pyqtSignal, QTimer
+from PyQt6.QtCore import Qt, QThread, pyqtSignal, QTimer, QUrl
 from PyQt6.QtGui import QIcon
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from Data.okx_public_data import fetch_okx_ticker
-from Data.blofin_oublic_data import fetch_blofin_instruments, get_blofin_spot_pairs_via_ws
 from backtest_strategies.strategies import moving_average_crossover_strategy, rsi_strategy, buy_and_hold_strategy
 from src.utils.data_storage import save_ohlcv, load_ohlcv
 from src.utils.helpers import fetch_ohlcv
@@ -26,11 +25,15 @@ import numpy as np
 from dotenv import load_dotenv
 import os
 import requests
-from src.analysis.ml import MLAnalyzer, launch_optuna_dashboard
+from src.analysis.ml import MLAnalyzer
 from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
 import matplotlib.pyplot as plt
 import matplotlib.dates as mdates
 from mplfinance.original_flavor import candlestick_ohlc
+import plotly.graph_objects as go
+from PyQt6.QtWebEngineWidgets import QWebEngineView  # Requires PyQtWebEngine
+import tempfile
+from Data.ccxt_public_data import fetch_ccxt_ohlcv
 
 load_dotenv()
 
@@ -81,7 +84,7 @@ class MainWindow(QMainWindow):
 
         # ML Algorithm Selector
         self.algorithm_combo = QComboBox()
-        self.algorithm_combo.addItems(["RandomForest", "GradientBoosting", "SVM", "XGBoost"])
+        self.algorithm_combo.addItems(["RandomForest", "GradientBoosting", "SVM", "XGBoost", "Ensemble (Voting)", "Ensemble (Stacking)"])
         self.algorithm_combo.setCurrentText(self.selected_algorithm)
         self.algorithm_combo.currentTextChanged.connect(self.on_algorithm_changed)
         controls_layout.addWidget(QLabel("ML Algorithm:"))
@@ -118,6 +121,8 @@ class MainWindow(QMainWindow):
         self.analyze_button.clicked.connect(self.run_analysis)
         self.train_button = QPushButton("Train Model")
         self.train_button.clicked.connect(self.train_model)
+        self.feature_report_button = QPushButton("Feature Report")
+        self.feature_report_button.clicked.connect(self.show_feature_report_window)
 
         # Data Table
         self.data_table = QTableWidget()
@@ -135,10 +140,6 @@ class MainWindow(QMainWindow):
         # Test API Button (was OKX API Test Button)
         self.test_api_button = QPushButton("Test API")
         self.test_api_button.clicked.connect(self.run_api_test)
-
-        # Download Button
-        self.download_button = QPushButton("Download Historical Data")
-        self.download_button.clicked.connect(self.download_historical_data)
 
         # Download All Timeframes Button
         self.download_all_button = QPushButton("Download All Timeframes")
@@ -166,9 +167,10 @@ class MainWindow(QMainWindow):
         self.backtest_button = QPushButton("Backtest")
         self.backtest_button.clicked.connect(self.run_backtest)
 
-        # Add Optuna Dashboard Button
-        self.optuna_dashboard_button = QPushButton("Optuna Dashboard")
-        self.optuna_dashboard_button.clicked.connect(self.run_optuna_dashboard)
+        # Show Chart Toggle Button
+        self.show_chart_button = QPushButton("Show Chart")
+        self.show_chart_button.setCheckable(True)
+        self.show_chart_button.toggled.connect(self.toggle_chart_window)
 
         # Add Current section for real-time data
         self.current_label = QLabel("<b>Current:</b> --")
@@ -182,29 +184,17 @@ class MainWindow(QMainWindow):
         self.data_timestamp_label.setTextFormat(Qt.TextFormat.RichText)
         main_layout.addWidget(self.data_timestamp_label)
 
-        # Add Matplotlib FigureCanvas for chart visualization (initially hidden)
-        self.figure = plt.Figure(figsize=(10, 5))
-        self.canvas = FigureCanvas(self.figure)
-        self.canvas.setVisible(False)
-        # Add a checkbox to toggle chart visibility
-        self.show_chart_checkbox = QCheckBox("Show Chart")
-        self.show_chart_checkbox.setChecked(False)
-        self.show_chart_checkbox.stateChanged.connect(self.toggle_chart_visibility)
-        # Add to layout
-        main_layout.addWidget(self.show_chart_checkbox)
-        main_layout.addWidget(self.canvas)
-
         # Add widgets to main_layout (after creation)
         main_layout.addLayout(controls_layout)
         main_layout.addWidget(self.fetch_button)
         main_layout.addWidget(self.data_table)
         main_layout.addWidget(self.analyze_button)
         main_layout.addWidget(self.train_button)
-        main_layout.addWidget(self.download_button)
+        main_layout.addWidget(self.feature_report_button)
         main_layout.addWidget(self.download_all_button)
         main_layout.addWidget(self.progress_bar)
         main_layout.addWidget(self.backtest_button)
-        main_layout.addWidget(self.optuna_dashboard_button)
+        main_layout.addWidget(self.show_chart_button)
         main_layout.addWidget(self.test_api_button)
         main_layout.addWidget(self.current_label)
         main_layout.addWidget(self.reversal_label)  # Add reversal label to layout
@@ -278,7 +268,7 @@ class MainWindow(QMainWindow):
     def fetch_data(self):
         self.update_exchange_status()
         # Use the actual selected_pair for CCXT, else construct symbol as before
-        if self.selected_exchange.lower().startswith("ccxt:"):
+        if hasattr(self, 'selected_exchange') and self.selected_exchange.lower().startswith("ccxt:"):
             symbol = self.selected_pair
             ccxt_name = self.selected_exchange.split(":", 1)[1]
             norm_timeframe = self.get_ccxt_timeframe(ccxt_name, self.timeframe_combo.currentText())
@@ -294,7 +284,7 @@ class MainWindow(QMainWindow):
             return
         rows = 1000
         exchange = getattr(self, 'selected_exchange', 'OKX')
-        use_ws = (exchange == "Blofin")
+        use_ws = False
         ohlcv = fetch_ohlcv(exchange, symbol, norm_timeframe, limit=rows, use_ws=use_ws)
         if ohlcv:
             self.data_table.setVisible(True)
@@ -411,7 +401,7 @@ class MainWindow(QMainWindow):
         self.last_df_hist = df_hist
         # Plot analysis chart if visible
         try:
-            if self.show_chart_checkbox.isChecked() and self.last_analysis:
+            if self.show_chart_button.isChecked() and self.last_analysis:
                 self.plot_analysis(self.last_df_hist, self.last_analysis)
         except Exception as e:
             print(f"Plotting error: {e}")
@@ -526,7 +516,6 @@ Do NOT provide trading recommendations, entry/exit prices, or any rationale for 
         html += f"<li><b>Confidence:</b> <span style='color:gold;font-weight:bold'>{result.get('confidence',0):.2f}%</span></li>"
         html += f"<li><b>Current Price:</b> <span style='color:gold;font-weight:bold'>{fmt_price(result.get('current_price','N/A'))}</span></li>"
         html += f"<li><b>Sentiment:</b> <span style='color:{color_for_sentiment(result.get('metrics',{}).get('market_sentiment',''))};'>{result.get('metrics',{}).get('market_sentiment','N/A')}</span></li>"
-        html += f"<li><b>Position Size:</b> {result.get('metrics',{}).get('position_size_recommendation',0):.2f}%</li>"
         html += f"<li><b>Timeframe Suitability:</b> {result.get('metrics',{}).get('timeframe_suitability','N/A')}</li>"
         # Support/Resistance
         support_levels = ', '.join(fmt_price(s) for s in result.get('support_levels', []))
@@ -555,23 +544,15 @@ Do NOT provide trading recommendations, entry/exit prices, or any rationale for 
         """
         Add a suite of technical indicators to the OHLCV DataFrame using pandas_ta default column names for all indicators.
         """
-        import time
-        import logging
+        import pandas_ta as ta
+        import numpy as np
+        import pandas as pd
         if df.empty or not all(col in df.columns for col in ['open', 'high', 'low', 'close', 'volume']):
             raise ValueError("DataFrame is empty or missing required OHLCV columns.")
         if df['close'].isnull().all():
             raise ValueError("No valid 'close' price data available for indicator calculation.")
-        timings = {}
-        t0 = time.perf_counter()
         df = df.rename(columns={col: col.lower() for col in df.columns})
-        timings['rename'] = time.perf_counter() - t0
-        required_cols = {'open', 'high', 'low', 'close', 'volume'}
-        if not required_cols.issubset(df.columns):
-            raise ValueError(
-                f"DataFrame must contain columns: {required_cols}. "
-                f"Found: {set(df.columns)}"
-            )
-        # Add all indicators with pandas_ta default names
+        # --- Standard indicators ---
         indicators = [
             ta.ema(df['close'], length=9),
             ta.ema(df['close'], length=20),
@@ -591,20 +572,39 @@ Do NOT provide trading recommendations, entry/exit prices, or any rationale for 
             ta.cmf(df['high'], df['low'], df['close'], df['volume'], length=20),
         ]
         for ind in indicators:
-            t0 = time.perf_counter()
             if ind is not None:
                 df = pd.concat([df, ind], axis=1)
-            timings[str(ind)] = time.perf_counter() - t0
+        # --- Advanced features ---
+        # Candle pattern flags
+        candle_patterns = ['cdl_engulfing', 'cdl_hammer', 'cdl_doji', 'cdl_morningstar', 'cdl_eveningstar']
+        for pat in candle_patterns:
+            try:
+                df[pat] = getattr(ta, pat)(df['open'], df['high'], df['low'], df['close'])
+            except Exception:
+                df[pat] = 0
+        # Rolling returns and volatility
+        df['return_1'] = df['close'].pct_change(1)
+        df['return_5'] = df['close'].pct_change(5)
+        df['volatility_5'] = df['close'].rolling(5).std()
+        df['volatility_20'] = df['close'].rolling(20).std()
+        # Price/MA ratios
+        df['close_ema9_ratio'] = df['close'] / df['close'].ewm(span=9, adjust=False).mean()
+        df['close_ema20_ratio'] = df['close'] / df['close'].ewm(span=20, adjust=False).mean()
+        # Time-of-day features
+        if isinstance(df.index, pd.DatetimeIndex):
+            df['hour'] = df.index.hour
+            df['dayofweek'] = df.index.dayofweek
+        else:
+            df['hour'] = 0
+            df['dayofweek'] = 0
         df = df.dropna().reset_index(drop=True)
-        logging.info("[PROFILE] Indicator timings: %s", timings)
-        print("[PROFILE] Indicator timings:", timings)
-        # Ensure at least min_rows after cleaning
         valid_rows = len(df.dropna(subset=["open", "high", "low", "close", "volume"]))
         if valid_rows < min_rows:
             raise ValueError(f"Not enough valid data for indicator calculation. At least {min_rows} rows are required after cleaning. Valid rows: {valid_rows}")
         return df
 
     def train_model(self):
+        from PyQt6.QtWidgets import QMessageBox
         # Use a default or dynamically determined rows value
         rows = 1000  # Default value, or compute based on timeframe/algorithm if needed
         custom = self.select_pair_button.text().strip().upper()
@@ -615,22 +615,22 @@ Do NOT provide trading recommendations, entry/exit prices, or any rationale for 
             return
         timeframe = self.timeframe_combo.currentText()
         norm_timeframe = self.timeframe_map.get(timeframe, timeframe)
-        # Determine the max lookback needed by indicators (e.g., EMA 100, MACD 26, etc.)
-        indicator_lookback = max([100, 26, 20, 14])  # EMA 100, MACD slow, BBands, ATR, etc.
+        indicator_lookback = max([100, 26, 20, 14])
         min_required_rows = rows + indicator_lookback
-        df_hist = load_ohlcv(symbol, norm_timeframe)
-        # If not enough rows, try to fetch more
-        if df_hist.shape[0] < min_required_rows:
-            from Data.okx_public_data import fetch_okx_ohlcv
-            ohlcv = fetch_okx_ohlcv(symbol, norm_timeframe, limit=min_required_rows)
-            if ohlcv:
-                save_ohlcv(symbol, norm_timeframe, ohlcv)
-                df_hist = load_ohlcv(symbol, norm_timeframe)
+        from src.utils.helpers import fetch_ohlcv
+        exchange = getattr(self, 'selected_exchange', 'OKX')
+        ohlcv = fetch_ohlcv(exchange, symbol, norm_timeframe, limit=min_required_rows)
+        from src.utils.data_storage import save_ohlcv, load_ohlcv
+        df_hist = None
+        if ohlcv:
+            save_ohlcv(symbol, norm_timeframe, ohlcv)
+            df_hist = load_ohlcv(symbol, norm_timeframe)
+        else:
+            df_hist = pd.DataFrame()
         if df_hist.empty:
             self.llm_output.setHtml("<b>[ML Training]</b> No historical data available for this symbol/timeframe.")
             return
         valid_rows = len(df_hist.dropna(subset=["open", "high", "low", "close", "volume"]))
-        # Dynamically adjust rows to fit indicator requirements
         if valid_rows < indicator_lookback:
             self.llm_output.setHtml(
                 f"<b>[ML Training]</b> Not enough valid data for indicator calculation. At least {indicator_lookback} rows are required after cleaning. Valid rows: {valid_rows}"
@@ -652,6 +652,32 @@ Do NOT provide trading recommendations, entry/exit prices, or any rationale for 
             self.llm_output.setHtml(f"<b>[ML Training]</b> {e}")
             return
         self.ml_analyzer.set_custom_model_class(None)
+        # --- Prompt for hyperparameter tuning if supported ---
+        if "Ensemble" not in self.selected_algorithm:
+            reply = QMessageBox.question(self, "Hyperparameter Tuning", "Do you want to run Optuna hyperparameter tuning?", QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
+            if reply == QMessageBox.StandardButton.Yes:
+                self.llm_output.setHtml("<b>[ML Training]</b> Running Optuna hyperparameter tuning... (this may take a while)")
+                QApplication.processEvents()
+                study = self.ml_analyzer.optimize_with_optuna(df_hist, model_type=self.selected_algorithm, n_trials=20)
+                best_trial = study.best_trial
+                best_params = best_trial.params
+                best_score = best_trial.value
+                html = f"""
+                <div style='font-family:Arial,sans-serif;'>
+                <h2 style='margin-bottom:0;'>Optuna Hyperparameter Tuning Results</h2>
+                <b>Algorithm:</b> {self.selected_algorithm}<br>
+                <b>Best Score (Accuracy):</b> <span style='color:green;font-weight:bold;'>{best_score:.4f}</span><br>
+                <b>Best Hyperparameters:</b><br>
+                <ul>
+                {''.join(f'<li><b>{k}:</b> {v}</li>' for k, v in best_params.items())}
+                </ul>
+                <b>Timestamp:</b> {datetime.now().isoformat()}<br>
+                <hr style='margin:8px 0;'>
+                </div>
+                """
+                self.llm_output.setHtml(html)
+                return
+        # --- Standard training ---
         results = self.ml_analyzer.train_model(df_hist)
         self.llm_output.setHtml(self.format_ml_training_result_html(results))
 
@@ -697,185 +723,193 @@ Do NOT provide trading recommendations, entry/exit prices, or any rationale for 
         <b>Training Time:</b> {result.get('training_time', 0):.2f} seconds<br>
         <b>Timestamp:</b> {result.get('timestamp', '')}<br>
         <hr style='margin:8px 0;'>
-        </div>
         """
-        return html
-
-    def download_historical_data(self):
-        rows = 1000
-        custom = self.select_pair_button.text().strip().upper()
-        # Use the actual selected_pair for CCXT, else construct symbol as before
-        if hasattr(self, 'selected_exchange') and self.selected_exchange.lower().startswith("ccxt:"):
-            symbol = self.selected_pair
-            ccxt_name = self.selected_exchange.split(":", 1)[1]
-            norm_timeframe = self.get_ccxt_timeframe(ccxt_name, self.timeframe_combo.currentText())
-        else:
-            symbol = f"{custom}/USDT"
-            norm_timeframe = self.timeframe_map.get(self.timeframe_combo.currentText(), self.timeframe_combo.currentText()).lower()
-        self.progress_bar.setMaximum(1)
-        self.progress_bar.setValue(0)
-        self.progress_bar.setVisible(True)
-        self.progress_bar.setFormat(f"Downloading {rows} rows of historical data... %p%")
-        QApplication.processEvents()
-        results = []
-        exchange = getattr(self, 'selected_exchange', 'OKX')
-        use_ws = (exchange == "Blofin")
-        # Handle CCXT ALL PAIRS batch download (not supported in this single-pair mode)
-        if exchange.lower().startswith("ccxt:"):
-            ccxt_name = exchange.split(":", 1)[1]
-            norm_timeframe_ccxt = self.get_ccxt_timeframe(ccxt_name, self.timeframe_combo.currentText())
-            from Data.ccxt_public_data import fetch_ccxt_ohlcv
-            ccxt_symbol = self.selected_pair if hasattr(self, 'selected_pair') else symbol
-            ohlcv = fetch_ccxt_ohlcv(ccxt_name, ccxt_symbol, norm_timeframe_ccxt, rows)
-            if ohlcv:
-                save_ohlcv(ccxt_symbol, norm_timeframe_ccxt, ohlcv)
-                self.llm_output.append(f"<b>[Download]</b> Downloaded {len(ohlcv)} rows for {ccxt_symbol} ({norm_timeframe_ccxt}) from {exchange}. Starting training...")
-                results.append((exchange, ohlcv))
-            else:
-                self.llm_output.append(f"<b>[Download]</b> Failed to download historical data for {ccxt_symbol} ({norm_timeframe_ccxt}) from {exchange}.")
-            self.progress_bar.setValue(self.progress_bar.value() + 1)
-            QApplication.processEvents()
-        else:
-            ohlcv = fetch_ohlcv(exchange, symbol, norm_timeframe, limit=rows, use_ws=use_ws)
-            if ohlcv:
-                save_ohlcv(symbol, norm_timeframe, ohlcv)
-                self.llm_output.append(f"<b>[Download]</b> Downloaded {len(ohlcv)} rows for {symbol} ({norm_timeframe}) from {exchange}. Starting training...")
-                results.append((exchange, ohlcv))
-            else:
-                self.llm_output.append(f"<b>[Download]</b> Failed to download historical data for {symbol} ({norm_timeframe}) from {exchange}.")
-            self.progress_bar.setValue(self.progress_bar.value() + 1)
-            QApplication.processEvents()
-        for exch, ohlcv in results:
-            df_hist = load_ohlcv(symbol, norm_timeframe)
-            if df_hist.empty or 'close' not in df_hist or df_hist['close'].isnull().all():
-                self.progress_bar.setVisible(False)
-                self.llm_output.setHtml(f"<b>[ML Training]</b> No valid historical data available for this symbol/timeframe from {exch}.")
-                continue
-            df_hist = df_hist.rename(columns={col: col.lower() for col in df_hist.columns})
-            valid_rows = len(df_hist.dropna(subset=["open", "high", "low", "close", "volume"]))
-            if valid_rows < rows:
-                self.llm_output.append(
-                    f"<b>[ML Training]</b> Only {valid_rows} rows available for training after indicator calculation from {exch}. Proceeding with available data."
-                )
-            try:
-                df_hist = self.add_technical_indicators(df_hist, min_rows=valid_rows)
-            except ValueError as e:
-                self.progress_bar.setVisible(False)
-                self.llm_output.setHtml(f"<b>[ML Training]</b> {e} ({exch})")
-                continue
-            self.ml_analyzer.set_custom_model_class(None)
-            results_ml = self.ml_analyzer.train_model(df_hist)
-            self.llm_output.append(f"<b>[ML Training]</b> Training complete for {exch}.")
-            self.llm_output.append(self.format_ml_training_result_html(results_ml))
-        self.progress_bar.setValue(1)
-        self.progress_bar.setVisible(False)
-
-    def run_backtest(self):
-        custom = self.select_pair_button.text().strip().upper()
-        if custom:
-            symbol = f"{custom}/USDT"
-        else:
-            self.llm_output.setHtml("<b>[Backtest]</b> Please enter a symbol (e.g., BTC) in the Pair field.")
-            return
-        timeframe = self.timeframe_combo.currentText()
-        norm_timeframe = self.timeframe_map.get(timeframe, timeframe)
-        rows = 1000
-        exchange = getattr(self, 'selected_exchange', 'OKX')
-        use_ws = (exchange == "Blofin")
-        ohlcv = fetch_ohlcv(exchange, symbol, norm_timeframe, limit=rows, use_ws=use_ws)
-        if ohlcv:
-            save_ohlcv(symbol, norm_timeframe, ohlcv)
-            df_hist = load_ohlcv(symbol, norm_timeframe)
-        else:
-            df_hist = load_ohlcv(symbol, norm_timeframe)
-        if df_hist.empty:
-            self.llm_output.setHtml("<b>[Backtest]</b> No historical data available for this symbol/timeframe.")
-            return
-        selected_strategy = self.strategy_combo.currentText()
-        if selected_strategy == "ML Model":
-            strategy_fn = None
-        elif selected_strategy == "Moving Average Crossover":
-            strategy_fn = lambda df: moving_average_crossover_strategy(df, short=10, long=30)
-        elif selected_strategy == "RSI":
-            strategy_fn = rsi_strategy
-        elif selected_strategy == "Buy & Hold":
-            strategy_fn = buy_and_hold_strategy
-        else:
-            strategy_fn = None
-        if self.ml_analyzer.algorithm != self.selected_algorithm:
-            self.on_algorithm_changed(self.selected_algorithm)
-        results = self.ml_analyzer.backtest(df_hist, strategy=strategy_fn)
-        self.llm_output.setHtml(self.format_backtest_result_html(results, selected_strategy))
-
-    def format_backtest_result_html(self, result: dict, strategy_name: str) -> str:
-        html = f"""
-        <div style='font-family:Arial,sans-serif;'>
-        <h2 style='margin-bottom:0;'>Backtest Summary</h2>
-        <b>Strategy:</b> {strategy_name}<br>
-        <b>Algorithm:</b> {result.get('algorithm', '')}<br>
-        <b>Splits:</b> {result.get('splits', 'N/A')}<br>
-        <b>Timestamp:</b> {result.get('timestamp', '')}<br>
-        <hr style='margin:8px 0;'>
-        <b>Mean Metrics:</b><br>
-        <table border='1' cellpadding='4' cellspacing='0'>
-            <tr><th>Metric</th><th>Value</th></tr>
-            <tr><td>Accuracy</td><td align='right'>{result.get('accuracy', 0):.4f}</td></tr>
-            <tr><td>F1 Score</td><td align='right'>{result.get('f1', 0):.4f}</td></tr>
-            <tr><td>Precision</td><td align='right'>{result.get('precision', 0):.4f}</td></tr>
-            <tr><td>Recall</td><td align='right'>{result.get('recall', 0):.4f}</td></tr>
-            <tr><td>Balanced Accuracy</td><td align='right'>{result.get('balanced_accuracy', 0):.4f}</td></tr>
-            <tr><td>ROC-AUC</td><td align='right'>{result.get('auc', 0) if result.get('auc') is not None else 'N/A'}</td></tr>
-            <tr><td>Cumulative Return</td><td align='right'>{result.get('mean_cumulative_return', 0):.4f}</td></tr>
-            <tr><td>Max Drawdown</td><td align='right'>{result.get('mean_max_drawdown', 0):.4f}</td></tr>
-            <tr><td>Sharpe Ratio</td><td align='right'>{result.get('mean_sharpe', 0):.4f}</td></tr>
-        </table>
-        <br>
-        <b>Per-Split Metrics:</b><br>
-        <table border='1' cellpadding='4' cellspacing='0'>
-            <tr><th>Split</th><th>Accuracy</th><th>F1</th><th>Precision</th><th>Recall</th><th>Balanced Acc</th><th>ROC-AUC</th><th>Return</th><th>Drawdown</th><th>Sharpe</th></tr>
-        """
-        for i, m in enumerate(result.get('split_metrics', [])):
-            html += f"<tr><td>{i+1}</td>"
-            html += f"<td align='right'>{m.get('accuracy', 0):.4f}</td>"
-            html += f"<td align='right'>{m.get('f1', 0):.4f}</td>"
-            html += f"<td align='right'>{m.get('precision', 0):.4f}</td>"
-            html += f"<td align='right'>{m.get('recall', 0):.4f}</td>"
-            html += f"<td align='right'>{m.get('balanced_accuracy', 0):.4f}</td>"
-            html += f"<td align='right'>{m.get('auc', 'N/A') if m.get('auc') is not None else 'N/A'}</td>"
-            html += f"<td align='right'>{m.get('cumulative_return', 0):.4f}</td>"
-            html += f"<td align='right'>{m.get('max_drawdown', 0):.4f}</td>"
-            html += f"<td align='right'>{m.get('sharpe', 0):.4f}</td>"
-            html += "</tr>"
-        html += "</table><br>"
-        # Per-split confusion matrix
-        html += "<b>Per-Split Confusion Matrices:</b><br>"
-        for i, m in enumerate(result.get('split_metrics', [])):
-            cm = m.get('confusion_matrix')
-            if cm:
-                html += f"<details><summary>Split {i+1} Confusion Matrix</summary>"
-                html += "<table border='1' cellpadding='2' cellspacing='0'>"
-                html += "<tr><th></th><th>Pred 0</th><th>Pred 1</th></tr>"
-                html += f"<tr><td><b>Actual 0</b></td><td align='center'>{cm[0][0]}</td><td align='center'>{cm[0][1]}</td></tr>"
-                html += f"<tr><td><b>Actual 1</b></td><td align='center'>{cm[1][0]}</td><td align='center'>{cm[1][1]}</td></tr>"
-                html += "</table></details>"
-        # Per-split classification report
-        html += "<b>Per-Split Classification Reports:</b><br>"
-        for i, m in enumerate(result.get('split_metrics', [])):
-            cr = m.get('classification_report')
-            if cr:
-                html += f"<details><summary>Split {i+1} Classification Report</summary>"
-                html += "<table border='1' cellpadding='2' cellspacing='0'>"
-                html += "<tr><th>Class</th><th>Precision</th><th>Recall</th><th>F1</th><th>Support</th></tr>"
-                for label in ['0', '1']:
-                    if label in cr:
-                        html += f"<tr><td>{label}</td>"
-                        html += f"<td align='right'>{cr[label]['precision']:.4f}</td>"
-                        html += f"<td align='right'>{cr[label]['recall']:.4f}</td>"
-                        html += f"<td align='right'>{cr[label]['f1-score']:.4f}</td>"
-                        html += f"<td align='right'>{cr[label]['support']}</td></tr>"
-                html += "</table></details>"
         html += "</div>"
         return html
+
+    def download_all_timeframes_for_selected_pair(self):
+        """
+        Download at least a month (30 days) of OHLCV data for all supported timeframes for the selected pair from OKX or CCXT exchanges.
+        Skip timeframes if recent data is already downloaded.
+        """
+        from Data.okx_public_data import fetch_okx_ohlcv
+        from Data.ccxt_public_data import fetch_ccxt_ohlcv
+        from src.utils.data_storage import save_ohlcv, load_ohlcv
+        import time
+        from datetime import datetime, timezone, timedelta
+        pair = self.select_pair_button.text().strip().upper()
+        if not pair or pair == "SELECT PAIR":
+            self.llm_output.append("<b>[Download]</b> Please select a pair first.")
+            return
+        # Define timeframes for both OKX and CCXT
+        timeframes = ["5m", "15m", "30m", "1h", "4h", "1d"]
+        minutes_per_timeframe = {"5m": 5, "15m": 15, "30m": 30, "1h": 60, "4h": 240, "1d": 1440}
+        bars_per_month = {tf: max(30, int((30*24*60)//minutes_per_timeframe[tf])) for tf in minutes_per_timeframe}
+        self.progress_bar.setVisible(True)
+        self.progress_bar.setMaximum(len(timeframes))
+        self.progress_bar.setValue(0)
+        self.progress_bar.setFormat("Downloading a month of all timeframes... %p%")
+        QApplication.processEvents()
+        # Determine exchange type
+        exchange = getattr(self, 'selected_exchange', 'OKX').lower()
+        if exchange == "okx":
+            fetch_func = fetch_okx_ohlcv
+            exchange_label = "OKX"
+        elif exchange.startswith("ccxt:"):
+            ccxt_name = exchange.split(':', 1)[1]
+            fetch_func = lambda symbol, tf, limit: fetch_ccxt_ohlcv(ccxt_name, symbol, tf, limit)
+            exchange_label = ccxt_name.upper()
+        else:
+            self.llm_output.append(f"<b>[Download]</b> Exchange {exchange} not supported for bulk download.")
+            self.progress_bar.setVisible(False)
+            return
+        for idx, tf in enumerate(timeframes):
+            limit = bars_per_month.get(tf, 30)
+            # Check if data is already downloaded and recent
+            df_hist = load_ohlcv(pair, tf)
+            skip = False
+            if not df_hist.empty:
+                # Check if last row timestamp is within 24 hours
+                last_ts = df_hist.iloc[-1]["timestamp"]
+                now = datetime.now(timezone.utc)
+                # Handle ms or s timestamps
+                if last_ts > 1e10:
+                    last_dt = datetime.fromtimestamp(last_ts / 1000, tz=timezone.utc)
+                else:
+                    last_dt = datetime.fromtimestamp(last_ts, tz=timezone.utc)
+                if (now - last_dt) < timedelta(hours=24):
+                    skip = True
+            if skip:
+                self.llm_output.append(f"<b>[Download]</b> Skipping {pair} ({tf}) [{exchange_label}] - already downloaded and recent.")
+                # Smooth progress bar animation for skipped
+                current_val = self.progress_bar.value()
+                target_val = current_val + 1
+                steps = 10
+                for step in range(1, steps + 1):
+                    self.progress_bar.setValue(current_val + (step * (target_val - current_val)) // steps)
+                    QApplication.processEvents()
+                    time.sleep(0.01)
+                continue
+            self.llm_output.append(f"<b>[Download]</b> Downloading {limit} rows for {pair} ({tf}) from {exchange_label}...")
+            QApplication.processEvents()
+            ohlcv = fetch_func(pair, tf, limit=limit)
+            if ohlcv:
+                save_ohlcv(pair, tf, ohlcv)
+                self.llm_output.append(f"<b>[Download]</b> Saved {len(ohlcv)} rows for {pair} ({tf}) [{exchange_label}]")
+            else:
+                self.llm_output.append(f"<b>[Download]</b> Failed to fetch data for {pair} ({tf}) [{exchange_label}]")
+            # Smooth progress bar animation
+            current_val = self.progress_bar.value()
+            target_val = current_val + 1
+            steps = 10
+            for step in range(1, steps + 1):
+                self.progress_bar.setValue(current_val + (step * (target_val - current_val)) // steps)
+                QApplication.processEvents()
+                time.sleep(0.03)
+        self.progress_bar.setVisible(False)
+        self.llm_output.append(f"<b>[Download]</b> A month of all timeframes downloaded for {pair} ({exchange_label}).")
+
+    def refresh_data_timestamp(self):
+        if self.last_data_fetch_time:
+            ts_str = self.last_data_fetch_time.strftime('%Y-%m-%d %H:%M:%S UTC')
+            self.data_timestamp_label.setText(f"<b>Last Data Fetch:</b> {ts_str}")
+        else:
+            self.data_timestamp_label.setText("<b>Last Data Fetch:</b> --")
+
+    def detect_reversal(self, ohlcv: list) -> str:
+        """
+        Simple reversal detection using last 3 candles (bullish/bearish engulfing).
+        Returns: 'bullish', 'bearish', or 'none'
+        """
+        if len(ohlcv) < 3:
+            return 'none'
+        prev2, prev1, last = ohlcv[-3], ohlcv[-2], ohlcv[-1]
+        # Bullish engulfing: last close > last open, last open < prev1 close, last close > prev1 open
+        if last[4] > last[1] and last[1] < prev1[4] and last[4] > prev1[1]:
+            return 'bullish'
+        # Bearish engulfing: last close < last open, last open > prev1 close, last close < prev1 open
+        if last[4] < last[1] and last[1] > prev1[4] and last[4] < prev1[1]:
+            return 'bearish'
+        return 'none'
+
+    def toggle_chart_window(self, checked: bool):
+        """
+        Open or close the chart window when the Show Chart button is toggled.
+        """
+        if checked:
+            # Placeholder: Open a new chart window (logic to be implemented)
+            self.chart_window = QWidget()
+            self.chart_window.setWindowTitle("Chart Window (Coming Soon)")
+            self.chart_window.setGeometry(200, 200, 800, 500)
+            self.chart_window.show()
+        else:
+            if hasattr(self, 'chart_window') and self.chart_window:
+                self.chart_window.close()
+                self.chart_window = None
+
+    def plot_analysis(self, klines_data: pd.DataFrame, analysis: dict) -> None:
+        """
+        Plot OHLCV candlestick chart with ML analysis overlays in the GUI using Plotly.
+        Only plot if chart is visible.
+        """
+        if not self.show_chart_button.isChecked():
+            return
+        # Prepare data
+        df = klines_data.copy()
+        df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms' if df['timestamp'].max() > 1e10 else 's')
+        df.set_index('timestamp', inplace=True)
+        # Plotly candlestick
+        fig = go.Figure()
+        fig.add_trace(go.Candlestick(
+            x=df.index,
+            open=df['open'],
+            high=df['high'],
+            low=df['low'],
+            close=df['close'],
+            name='Price',
+        ))
+        # Overlay signals
+        if 'entry_points' in analysis:
+            for entry in analysis['entry_points']:
+                fig.add_hline(y=entry, line_dash='dash', line_color='blue', annotation_text='Entry', annotation_position='top left')
+        if 'exit_points' in analysis:
+            for tp in analysis['exit_points']:
+                fig.add_hline(y=tp, line_dash='dot', line_color='green', annotation_text='Take Profit', annotation_position='top left')
+        if 'stop_loss_points' in analysis:
+            for sl in analysis['stop_loss_points']:
+                fig.add_hline(y=sl, line_dash='dot', line_color='red', annotation_text='Stop Loss', annotation_position='top left')
+        fig.update_layout(
+            title=f"{analysis.get('symbol', '')} {analysis.get('timeframe', '')} - {analysis.get('recommendation', '')}",
+            xaxis_title='Date',
+            yaxis_title='Price',
+            legend=dict(orientation='h'),
+            hovermode='x unified',
+            height=500,
+        )
+        # TODO: Overlay equity curve if available in analysis
+        # Render Plotly in PyQt6 using QWebEngineView
+        html = fig.to_html(include_plotlyjs='cdn')
+        # If chart_window doesn't exist, create it
+        if not hasattr(self, 'chart_window') or self.chart_window is None:
+            self.chart_window = QWidget()
+            self.chart_window.setWindowTitle("Chart Window")
+            self.chart_window.setGeometry(200, 200, 900, 600)
+            self.chart_layout = QVBoxLayout()
+            self.chart_window.setLayout(self.chart_layout)
+        # Remove previous chart widget if exists
+        if hasattr(self, 'plotly_view') and self.plotly_view is not None:
+            self.chart_layout.removeWidget(self.plotly_view)
+            self.plotly_view.deleteLater()
+            self.plotly_view = None
+        # Create new QWebEngineView and load HTML
+        self.plotly_view = QWebEngineView()
+        # Save HTML to temp file and load
+        with tempfile.NamedTemporaryFile(delete=False, suffix='.html') as f:
+            f.write(html.encode('utf-8'))
+            temp_html_path = f.name
+        self.plotly_view.load(QUrl.fromLocalFile(temp_html_path))
+        self.chart_layout.addWidget(self.plotly_view)
+        self.chart_window.show()
 
     def on_algorithm_changed(self, algorithm: str):
         self.selected_algorithm = algorithm
@@ -914,6 +948,9 @@ Do NOT provide trading recommendations, entry/exit prices, or any rationale for 
         super().closeEvent(event)
 
     def get_ccxt_pairs(self, exchange_name: str) -> set:
+        # Map 'binance' to 'binanceus' for US region compliance
+        if exchange_name == "binance":
+            exchange_name = "binanceus"
         if not hasattr(self, 'ccxt_pair_cache'):
             self.ccxt_pair_cache = {}
         if exchange_name in self.ccxt_pair_cache:
@@ -941,7 +978,6 @@ Do NOT provide trading recommendations, entry/exit prices, or any rationale for 
             return
 
         from Data.okx_public_data import fetch_okx_ticker
-        from Data.blofin_oublic_data import fetch_blofin_instruments, get_blofin_spot_pairs_via_ws
         # Hide the data table
         self.data_table.setVisible(False)
         # Create the pair menu widget
@@ -954,9 +990,9 @@ Do NOT provide trading recommendations, entry/exit prices, or any rationale for 
         self.pair_list = QListWidget()
         layout.addWidget(QLabel("Select a Pair:"))
         layout.addWidget(self.pair_list)
-        self.ccxt_exchanges = ["binance", "okx", "kraken", "bybit", "kucoin"]
+        self.ccxt_exchanges = ["binanceus", "okx", "kraken", "bybit", "kucoin"]
         self.exchange_combo = QComboBox()
-        self.exchange_combo.addItems(["All", "OKX", "Blofin", "MEXC"] + [f"CCXT:{exch}" for exch in self.ccxt_exchanges])
+        self.exchange_combo.addItems(["All", "OKX"] + [f"CCXT:{exch}" for exch in self.ccxt_exchanges])
         layout.addWidget(QLabel("Exchange:"))
         layout.addWidget(self.exchange_combo)
         self.pair_menu_widget.setLayout(layout)
@@ -972,53 +1008,15 @@ Do NOT provide trading recommendations, entry/exit prices, or any rationale for 
             )
         except Exception as e:
             okx_pairs = set([f"Error loading OKX pairs: {e}"])
-        # Fetch Blofin pairs via WebSocket (preferred)
-        try:
-            blofin_pairs = get_blofin_spot_pairs_via_ws(timeout=5)
-        except Exception as e:
-            blofin_pairs = set([f"Error loading Blofin pairs via WebSocket: {e}"])
-        # If WebSocket fails, try REST as fallback
-        if not blofin_pairs:
-            try:
-                import os
-                api_key = os.environ.get("BLOFIN_API_KEY")
-                secret = os.environ.get("BLOFIN_SECRET")
-                passphrase = os.environ.get("BLOFIN_PASSPHRASE")
-                instruments = fetch_blofin_instruments(api_key, secret, passphrase)
-                blofin_pairs = set()
-                for inst in instruments or []:
-                    if inst.get("quoteCcy", "") == "USDT":
-                        base = inst.get("baseCcy")
-                        quote = inst.get("quoteCcy")
-                        if base and quote:
-                            blofin_pairs.add(f"{base}/USDT")
-            except Exception as e:
-                blofin_pairs = set([f"Error loading Blofin pairs: {e}"])
-        # Fetch MEXC pairs
-        try:
-            import requests
-            resp = requests.get("https://api.mexc.com/api/v3/exchangeInfo", timeout=10)
-            resp.raise_for_status()
-            data = resp.json()
-            mexc_pairs = set()
-            for s in data.get('symbols', []):
-                if s.get('quoteAsset') == 'USDT' and s.get('status') == 'ENABLED':
-                    mexc_pairs.add(f"{s['baseAsset']}/USDT")
-        except Exception as e:
-            mexc_pairs = set([f"Error loading MEXC pairs: {e}"])
         # Merge and mark source (do not fetch CCXT pairs here)
-        all_pairs_set = okx_pairs | blofin_pairs | mexc_pairs
+        all_pairs_set = okx_pairs
         self.pair_sources = {}
         for p in all_pairs_set:
             srcs = []
             if p in okx_pairs:
                 srcs.append("OKX")
-            if p in blofin_pairs:
-                srcs.append("Blofin")
-            if p in mexc_pairs:
-                srcs.append("MEXC")
             self.pair_sources[p] = srcs
-        # Display as: BTC/USDT [OKX,Blofin,MEXC]
+        # Display as: BTC/USDT [OKX]
         self.all_pairs = [f"{p} [{','.join(self.pair_sources[p])}]" for p in sorted(all_pairs_set)]
         self.pair_list.addItems(self.all_pairs)
         self.pair_list.itemClicked.connect(self.select_pair_from_menu)
@@ -1057,13 +1055,9 @@ Do NOT provide trading recommendations, entry/exit prices, or any rationale for 
             pair, src = label.split("[")
             pair = pair.strip()
             srcs = src.strip("] ").split(",")
-            # Prefer OKX if available, else Blofin, else MEXC, else CCXT
+            # Prefer OKX if available, else CCXT
             if "OKX" in srcs:
                 self.selected_exchange = "OKX"
-            elif "Blofin" in srcs:
-                self.selected_exchange = "Blofin"
-            elif "MEXC" in srcs:
-                self.selected_exchange = "MEXC"
             elif any(s.startswith("CCXT:") for s in srcs):
                 ccxt_src = next(s for s in srcs if s.startswith("CCXT:"))
                 self.selected_exchange = ccxt_src.lower()
@@ -1089,146 +1083,281 @@ Do NOT provide trading recommendations, entry/exit prices, or any rationale for 
         # Automatically fetch data for the selected pair
         self.fetch_data()
 
-    def download_all_timeframes_for_selected_pair(self):
-        """
-        Download at least a month (30 days) of OHLCV data for all supported timeframes for the selected pair from both OKX (REST) and Blofin (WebSocket), if available.
-        """
-        from Data.okx_public_data import fetch_okx_ohlcv
-        from Data.blofin_oublic_data import BlofinWebSocketClient
-        from src.utils.data_storage import save_ohlcv
-        pair = self.select_pair_button.text().strip().upper()
-        if not pair or pair == "SELECT PAIR":
-            self.llm_output.append("<b>[Download]</b> Please select a pair first.")
-            return
-        okx_timeframes = ["5m", "15m", "30m", "1h", "4h", "1D"]
-        blofin_timeframes = ["5m", "15m", "30m", "1h", "4h", "1d"]
-        # Calculate limits for a month (30 days) for each timeframe
-        minutes_per_timeframe = {
-            "5m": 5,
-            "15m": 15,
-            "30m": 30,
-            "1h": 60,
-            "4h": 240,
-            "1D": 1440,
-            "1d": 1440
-        }
-        # 30 days worth of bars for each timeframe
-        bars_per_month = {tf: max(30, int((30*24*60)//minutes_per_timeframe[tf])) for tf in minutes_per_timeframe}
-        self.progress_bar.setVisible(True)
-        self.progress_bar.setMaximum(len(okx_timeframes) + len(blofin_timeframes))
-        self.progress_bar.setValue(0)
-        self.progress_bar.setFormat("Downloading a month of all timeframes (OKX & Blofin)... %p%")
-        QApplication.processEvents()
-        # Ensure pair_sources is initialized
-        if not hasattr(self, 'pair_sources'):
-            self.pair_sources = {}
-        # Download from OKX if supported
-        if "OKX" in self.pair_sources.get(pair, []):
-            for tf in okx_timeframes:
-                limit = bars_per_month.get(tf, 30)
-                self.llm_output.append(f"<b>[Download]</b> Downloading {limit} rows for {pair} ({tf}) from OKX...")
-                QApplication.processEvents()
-                ohlcv = fetch_okx_ohlcv(pair, tf, limit=limit)
-                if ohlcv:
-                    save_ohlcv(pair, tf, ohlcv)
-                    self.llm_output.append(f"<b>[Download]</b> Saved {len(ohlcv)} rows for {pair} ({tf}) [OKX]")
-                else:
-                    self.llm_output.append(f"<b>[Download]</b> Failed to fetch data for {pair} ({tf}) [OKX]")
-                self.progress_bar.setValue(self.progress_bar.value() + 1)
-                QApplication.processEvents()
-        # Download from Blofin WebSocket if supported
-        if "Blofin" in self.pair_sources.get(pair, []):
-            inst_id = pair.replace("/", "-") + "-SPOT" if not pair.endswith("-SPOT") else pair
-            ws_client = BlofinWebSocketClient()
-            for tf in blofin_timeframes:
-                limit = bars_per_month.get(tf, 30)
-                self.llm_output.append(f"<b>[Download]</b> Downloading {limit} rows for {pair} ({tf}) via Blofin WebSocket...")
-                QApplication.processEvents()
-                ohlcv = ws_client.fetch_ohlcv(inst_id, bar=tf, limit=limit, timeout=5.0)
-                if ohlcv:
-                    save_ohlcv(pair, tf, ohlcv)
-                    self.llm_output.append(f"<b>[Download]</b> Saved {len(ohlcv)} rows for {pair} ({tf}) [Blofin]")
-                else:
-                    self.llm_output.append(f"<b>[Download]</b> Failed to fetch data for {pair} ({tf}) [Blofin]")
-                self.progress_bar.setValue(self.progress_bar.value() + 1)
-                QApplication.processEvents()
-        self.progress_bar.setVisible(False)
-        self.llm_output.append(f"<b>[Download]</b> A month of all timeframes downloaded for {pair} (OKX & Blofin).")
-
-    def refresh_data_timestamp(self):
-        if self.last_data_fetch_time:
-            ts_str = self.last_data_fetch_time.strftime('%Y-%m-%d %H:%M:%S UTC')
-            self.data_timestamp_label.setText(f"<b>Last Data Fetch:</b> {ts_str}")
+    def run_backtest(self):
+        custom = self.select_pair_button.text().strip().upper()
+        if custom:
+            symbol = f"{custom}/USDT"
         else:
-            self.data_timestamp_label.setText("<b>Last Data Fetch:</b> --")
-
-    def run_optuna_dashboard(self):
-        """Prompt for Optuna storage URI and port, then launch the dashboard."""
-        storage, ok = QInputDialog.getText(self, "Optuna Storage URI", "Enter Optuna storage URI:", QLineEdit.EchoMode.Normal, "sqlite:///example.db")
-        if not ok or not storage:
+            # Only show error in main area if no symbol
+            self.llm_output.setHtml("<b>[Backtest]</b> Please enter a symbol (e.g., BTC) in the Pair field.")
             return
-        port, ok = QInputDialog.getInt(self, "Optuna Dashboard Port", "Enter port for dashboard:", 8080, 1024, 65535, 1)
-        if not ok:
+        timeframe = self.timeframe_combo.currentText()
+        norm_timeframe = self.timeframe_map.get(timeframe, timeframe)
+        rows = 1000
+        exchange = getattr(self, 'selected_exchange', 'OKX')
+        use_ws = False
+        ohlcv = fetch_ohlcv(exchange, symbol, norm_timeframe, limit=rows, use_ws=use_ws)
+        if ohlcv:
+            save_ohlcv(symbol, norm_timeframe, ohlcv)
+            df_hist = load_ohlcv(symbol, norm_timeframe)
+        else:
+            df_hist = load_ohlcv(symbol, norm_timeframe)
+        if df_hist.empty:
+            # Only show error in main area if no data
+            self.llm_output.setHtml("<b>[Backtest]</b> No historical data available for this symbol/timeframe.")
             return
-        launch_optuna_dashboard(storage, port)
-        self.llm_output.append(f"<b>[Optuna]</b> Dashboard launched at <a href='http://localhost:{port}'>http://localhost:{port}</a> for storage: {storage}")
+        selected_strategy = self.strategy_combo.currentText()
+        if selected_strategy == "ML Model":
+            strategy_fn = None
+        elif selected_strategy == "Moving Average Crossover":
+            strategy_fn = lambda df: moving_average_crossover_strategy(df, short=10, long=30)
+        elif selected_strategy == "RSI":
+            strategy_fn = rsi_strategy
+        elif selected_strategy == "Buy & Hold":
+            strategy_fn = buy_and_hold_strategy
+        else:
+            strategy_fn = None
+        if self.ml_analyzer.algorithm != self.selected_algorithm:
+            self.on_algorithm_changed(self.selected_algorithm)
+        results = self.ml_analyzer.backtest(df_hist, strategy=strategy_fn)
+        self.last_backtest_results = results
+        # Open a new window to display backtest results
+        self.show_backtest_results_window(results, selected_strategy)
 
-    def detect_reversal(self, ohlcv: list) -> str:
+    def show_backtest_results_window(self, results: dict, strategy: str):
         """
-        Simple reversal detection using last 3 candles (bullish/bearish engulfing).
-        Returns: 'bullish', 'bearish', or 'none'
+        Open a new window to display backtest results in a compact, readable way, using a summary table and compact per-split tables. No equity curve chart.
+        Each metric has a dropdown for a concise description. Confusion matrix is shown in its own tab per split.
         """
-        if len(ohlcv) < 3:
-            return 'none'
-        prev2, prev1, last = ohlcv[-3], ohlcv[-2], ohlcv[-1]
-        # Bullish engulfing: last close > last open, last open < prev1 close, last close > prev1 open
-        if last[4] > last[1] and last[1] < prev1[4] and last[4] > prev1[1]:
-            return 'bullish'
-        # Bearish engulfing: last close < last open, last open > prev1 close, last close < prev1 open
-        if last[4] < last[1] and last[1] > prev1[4] and last[4] < prev1[1]:
-            return 'bearish'
-        return 'none'
+        from PyQt6.QtWidgets import (
+            QDialog, QVBoxLayout, QTableWidget, QTableWidgetItem, QPushButton, QTabWidget, QWidget, QHeaderView, QLabel, QHBoxLayout, QMessageBox, QTextEdit
+        )
+        from PyQt6.QtCore import Qt
 
-    def toggle_chart_visibility(self):
-        checked = self.show_chart_checkbox.isChecked()
-        self.canvas.setVisible(checked)
-        # Optionally, re-plot if showing
-        if checked and hasattr(self, 'last_analysis') and hasattr(self, 'last_df_hist'):
-            self.plot_analysis(self.last_df_hist, self.last_analysis)
+        # Concise descriptions for metrics
+        metric_descriptions = {
+            "accuracy": "Proportion of correct predictions (TP+TN)/(TP+TN+FP+FN)",
+            "f1": "Harmonic mean of precision and recall (2*P*R/(P+R))",
+            "precision": "TP/(TP+FP): Fraction of positive predictions that are correct.",
+            "recall": "TP/(TP+FN): Fraction of actual positives that are detected.",
+            "sharpe": "Risk-adjusted return (mean return / std dev of return)",
+            "cumulative_return": "Total return over the backtest period.",
+            "max_drawdown": "Maximum observed loss from a peak to a trough.",
+            "balanced_accuracy": "Average of recall obtained on each class.",
+            "auc": "Area under the ROC curve.",
+            "mean_sharpe": "Average Sharpe ratio across splits.",
+            "mean_cumulative_return": "Average cumulative return across splits.",
+            "mean_max_drawdown": "Average max drawdown across splits.",
+            "algorithm": "The model or strategy used for backtest.",
+            "splits": "Number of walk-forward splits.",
+            "timestamp": "Time when the backtest was run."
+        }
 
-    def plot_analysis(self, klines_data: pd.DataFrame, analysis: dict) -> None:
+        def metric_info_button(metric):
+            btn = QPushButton("?")
+            btn.setFixedWidth(22)
+            btn.setToolTip("Show description")
+            def show_desc():
+                desc = metric_descriptions.get(metric, "No description available.")
+                QMessageBox.information(btn, metric.replace('_', ' ').capitalize(), desc)
+            btn.clicked.connect(show_desc)
+            return btn
+
+        dialog = QDialog(self)
+        dialog.setWindowTitle(f"Backtest Results - {strategy}")
+        dialog.setGeometry(300, 300, 600, 400)
+        layout = QVBoxLayout()
+
+        tab_widget = QTabWidget()
+
+        # --- Top-level metrics table (compact, with info buttons) ---
+        metrics = [(k, v) for k, v in results.items() if k != "split_metrics" and k != "equity_curve"]
+        table = QTableWidget(len(metrics), 3)
+        table.setHorizontalHeaderLabels(["Metric", "Value", "Info"])
+        for row, (k, v) in enumerate(metrics):
+            item = QTableWidgetItem(str(k).replace('_', ' ').capitalize())
+            font = item.font()
+            font.setBold(True)
+            item.setFont(font)
+            table.setItem(row, 0, item)
+            if isinstance(v, float):
+                table.setItem(row, 1, QTableWidgetItem(f"{v:,.4f}"))
+            elif isinstance(v, int):
+                table.setItem(row, 1, QTableWidgetItem(f"{v:,}"))
+            elif isinstance(v, list) and v and all(isinstance(x, (float, int)) for x in v):
+                table.setItem(row, 1, QTableWidgetItem(", ".join(f"{x:.4f}" for x in v)))
+            else:
+                table.setItem(row, 1, QTableWidgetItem(str(v)))
+            table.setCellWidget(row, 2, metric_info_button(k))
+        table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
+        table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        tab_widget.addTab(table, "Summary")
+
+        # --- Split metrics (compact per-fold, with info buttons) ---
+        if "split_metrics" in results and isinstance(results["split_metrics"], list):
+            for i, split in enumerate(results["split_metrics"], 1):
+                split_tab = QWidget()
+                split_layout = QVBoxLayout()
+                # Only show key metrics (accuracy, f1, precision, recall, sharpe, cumulative_return, max_drawdown)
+                key_metrics = [
+                    ("accuracy", split.get("accuracy")),
+                    ("f1", split.get("f1")),
+                    ("precision", split.get("precision")),
+                    ("recall", split.get("recall")),
+                    ("sharpe", split.get("sharpe")),
+                    ("cumulative_return", split.get("cumulative_return")),
+                    ("max_drawdown", split.get("max_drawdown")),
+                ]
+                key_metrics = [(k, v) for k, v in key_metrics if v is not None]
+                split_table = QTableWidget(len(key_metrics), 3)
+                split_table.setHorizontalHeaderLabels(["Metric", "Value", "Info"])
+                for row, (k, v) in enumerate(key_metrics):
+                    item = QTableWidgetItem(str(k).replace('_', ' ').capitalize())
+                    font = item.font()
+                    font.setBold(True)
+                    item.setFont(font)
+                    split_table.setItem(row, 0, item)
+                    if isinstance(v, float):
+                        split_table.setItem(row, 1, QTableWidgetItem(f"{v:,.4f}"))
+                    elif isinstance(v, int):
+                        split_table.setItem(row, 1, QTableWidgetItem(f"{v:,}"))
+                    else:
+                        split_table.setItem(row, 1, QTableWidgetItem(str(v)))
+                    split_table.setCellWidget(row, 2, metric_info_button(k))
+                split_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
+                split_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+                split_layout.addWidget(split_table)
+                split_tab.setLayout(split_layout)
+                tab_widget.addTab(split_tab, f"Split {i}")
+
+                # Confusion matrix tab for this split
+                if "confusion_matrix" in split and isinstance(split["confusion_matrix"], list):
+                    cm_tab = QWidget()
+                    cm_layout = QVBoxLayout()
+                    cm_label = QLabel(f"Confusion Matrix (Split {i})")
+                    cm_layout.addWidget(cm_label)
+                    cm_table = QTableWidget(len(split["confusion_matrix"]), len(split["confusion_matrix"][0]))
+                    cm_table.setHorizontalHeaderLabels([str(j) for j in range(len(split["confusion_matrix"][0]))])
+                    cm_table.setVerticalHeaderLabels([str(j) for j in range(len(split["confusion_matrix"]))])
+                    for r, row_vals in enumerate(split["confusion_matrix"]):
+                        for c, val in enumerate(row_vals):
+                            cm_table.setItem(r, c, QTableWidgetItem(str(val)))
+                    cm_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
+                    cm_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+                    cm_layout.addWidget(cm_table)
+                    cm_tab.setLayout(cm_layout)
+                    tab_widget.addTab(cm_tab, f"Confusion Matrix (Split {i})")
+
+        layout.addWidget(tab_widget)
+        close_btn = QPushButton("Close")
+        close_btn.clicked.connect(dialog.accept)
+        layout.addWidget(close_btn)
+        dialog.setLayout(layout)
+        dialog.exec()
+
+    def format_backtest_result_html(self, results: dict, strategy: str) -> str:
         """
-        Plot OHLCV candlestick chart with ML analysis overlays in the GUI.
-        Only plot if chart is visible.
+        Format backtest results as HTML for display in the GUI.
+
+        Args:
+            results (dict): The dictionary of backtest results.
+            strategy (str): The name of the strategy used.
+
+        Returns:
+            str: HTML-formatted string for display.
         """
-        if not self.show_chart_checkbox.isChecked():
+        if not results:
+            return "<b>[Backtest]</b> No results to display."
+
+        html = f"<h3>Backtest Results: <span style='color:#007acc'>{strategy}</span></h3><ul>"
+        for key, value in results.items():
+            if key == "split_metrics" and isinstance(value, list):
+                html += "<li><b>Split Metrics:</b><ul>"
+                for i, split in enumerate(value, 1):
+                    html += f"<li><details><summary><b>Split {i}</b></summary><ul>"
+                    for k, v in split.items():
+                        if k == "confusion_matrix" and isinstance(v, list):
+                            html += "<li><b>Confusion Matrix:</b><br><table border='1' style='border-collapse:collapse;'>"
+                            for row in v:
+                                html += "<tr>" + "".join(f"<td>{cell}</td>" for cell in row) + "</tr>"
+                            html += "</table></li>"
+                        elif k == "classification_report" and isinstance(v, dict):
+                            html += "<li><b>Classification Report:</b><br><table border='1' style='border-collapse:collapse;'>"
+                            # Table header
+                            classes = [c for c in v.keys() if isinstance(v[c], dict)]
+                            metrics = ["precision", "recall", "f1-score", "support"]
+                            html += "<tr><th></th>" + "".join(f"<th>{m}</th>" for m in metrics) + "</tr>"
+                            for cls in classes:
+                                html += f"<tr><td>{cls}</td>"
+                                for m in metrics:
+                                    val = v[cls].get(m, "")
+                                    if isinstance(val, float):
+                                        html += f"<td>{val:.4f}</td>"
+                                    else:
+                                        html += f"<td>{val}</td>"
+                                html += "</tr>"
+                            html += "</table></li>"
+                        elif isinstance(v, float):
+                            html += f"<li><b>{k}:</b> {v:.4f}</li>"
+                        elif isinstance(v, int):
+                            html += f"<li><b>{k}:</b> {v}</li>"
+                        else:
+                            html += f"<li><b>{k}:</b> {v}</li>"
+                    html += "</ul></details></li>"
+                html += "</ul></li>"
+            elif isinstance(value, float):
+                html += f"<li><b>{key}:</b> {value:,.4f}</li>"
+            elif isinstance(value, int):
+                html += f"<li><b>{key}:</b> {value:,}</li>"
+            elif isinstance(value, dict):
+                html += f"<li><b>{key}:</b><ul>"
+                for k2, v2 in value.items():
+                    html += f"<li>{k2}: {v2}</li>"
+                html += "</ul></li>"
+            elif isinstance(value, list) and value and all(isinstance(x, (float, int)) for x in value):
+                formatted = ', '.join(f"{x:.4f}" for x in value)
+                html += f"<li><b>{key}:</b> <span style='font-family:monospace'>{formatted}</span></li>"
+            else:
+                html += f"<li><b>{key}:</b> {value}</li>"
+        html += "</ul>"
+        return html
+
+    def show_feature_report_window(self):
+        from PyQt6.QtWidgets import QDialog, QVBoxLayout, QTableWidget, QTableWidgetItem, QPushButton, QHeaderView, QLabel
+        from PyQt6.QtCore import Qt
+        import pandas as pd
+        # Use last_df_hist if available, else prompt to fetch/analyze
+        df = getattr(self, 'last_df_hist', None)
+        if df is None or df.empty:
+            self.llm_output.setHtml("<b>[Feature Report]</b> No data available. Please fetch data and run analysis first.")
             return
-        self.figure.clear()
-        ax = self.figure.add_subplot(111)
-        df = klines_data.copy()
-        df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms' if df['timestamp'].max() > 1e10 else 's')
-        df.set_index('timestamp', inplace=True)
-        # Prepare OHLC for mplfinance
-        ohlc = df[['open', 'high', 'low', 'close']].copy()
-        ohlc['date'] = mdates.date2num(df.index)
-        ohlc = ohlc[['date', 'open', 'high', 'low', 'close']].values
-        candlestick_ohlc(ax, ohlc, width=0.6/(len(df)), colorup='g', colordown='r', alpha=0.8)
-        # Plot signals
-        if 'entry_points' in analysis:
-            for entry in analysis['entry_points']:
-                ax.axhline(entry, color='blue', linestyle='--', alpha=0.7, label='Entry')
-        if 'exit_points' in analysis:
-            for tp in analysis['exit_points']:
-                ax.axhline(tp, color='green', linestyle=':', alpha=0.7, label='Take Profit')
-        if 'stop_loss_points' in analysis:
-            for sl in analysis['stop_loss_points']:
-                ax.axhline(sl, color='red', linestyle=':', alpha=0.7, label='Stop Loss')
-        ax.set_title(f"{analysis.get('symbol', '')} {analysis.get('timeframe', '')} - {analysis.get('recommendation', '')}")
-        ax.set_ylabel("Price")
-        ax.xaxis.set_major_formatter(mdates.DateFormatter('%Y-%m-%d %H:%M'))
-        self.figure.autofmt_xdate()
-        ax.legend(loc='upper left')
-        self.canvas.draw()
+        # Prepare feature info
+        exclude_columns = ['timestamp', 'open', 'high', 'low', 'close', 'volume']
+        feature_columns = [col for col in df.columns if col not in exclude_columns]
+        feature_types = [str(df[col].dtype) for col in feature_columns]
+        # Sample values (last row)
+        sample_row = df.iloc[-1] if not df.empty else None
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Feature Report")
+        dialog.setGeometry(350, 350, 700, 500)
+        layout = QVBoxLayout()
+        label = QLabel("<b>Features Used in Model Training</b>")
+        layout.addWidget(label)
+        table = QTableWidget(len(feature_columns), 3)
+        table.setHorizontalHeaderLabels(["Feature Name", "Type", "Sample Value"])
+        for i, (col, typ) in enumerate(zip(feature_columns, feature_types)):
+            table.setItem(i, 0, QTableWidgetItem(col))
+            table.setItem(i, 1, QTableWidgetItem(typ))
+            val = sample_row[col] if sample_row is not None and col in sample_row else ""
+            table.setItem(i, 2, QTableWidgetItem(str(val)))
+        table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
+        table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        layout.addWidget(table)
+        close_btn = QPushButton("Close")
+        close_btn.clicked.connect(dialog.accept)
+        layout.addWidget(close_btn)
+        dialog.setLayout(layout)
+        dialog.exec()
 
 def call_ollama_llm(prompt: str, model: str = "llama2", temperature: float = 0.2, max_tokens: int = 512) -> str:
     """

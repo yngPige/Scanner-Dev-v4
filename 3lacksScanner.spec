@@ -4,8 +4,12 @@
 a = Analysis(
     ['Features\\3lack_gui.py'],
     pathex=[],
-    binaries=[],
-    datas=[],
+    binaries=[
+        ('C:/Users/Administrator/Desktop/Scanner Dev v4/.venv/Lib/site-packages/xgboost/lib/xgboost.dll', 'xgboost/lib'),
+    ],
+    datas=[
+        ('C:/Users/Administrator/Desktop/Scanner Dev v4/.venv/Lib/site-packages/xgboost/VERSION', 'xgboost'),
+    ],
     hiddenimports=[],
     hookspath=[],
     hooksconfig={},

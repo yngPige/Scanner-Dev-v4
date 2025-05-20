@@ -6,8 +6,6 @@ import logging
 
 # Import per-exchange fetchers
 from Data.okx_public_data import fetch_okx_ohlcv
-from Data.blofin_oublic_data import BlofinWebSocketClient, fetch_blofin_ohlcv
-from Data.mexc_public_data import fetch_mexc_ohlcv
 from Data.ccxt_public_data import fetch_ccxt_ohlcv
 
 
@@ -108,6 +106,31 @@ def compute_resistance_levels(df: pd.DataFrame, window: int = 20) -> list[float]
     resistances = resistances[ (resistances.rolling(window, center=True).max() == resistances) ]
     return sorted(resistances.dropna().unique().tolist()) 
 
+def normalize_symbol(symbol: str, exchange: str) -> str:
+    """
+    Normalize trading pair symbol for the given exchange.
+    Ensures no duplicate quote, correct separator, and proper case.
+    """
+    symbol = symbol.strip().replace("-", "/").upper()
+    # Remove duplicate /USDT or /USD
+    if symbol.count("/USDT") > 1:
+        symbol = symbol.replace("/USDT/USDT", "/USDT")
+    if symbol.count("/USD") > 1:
+        symbol = symbol.replace("/USD/USD", "/USD")
+    # Remove trailing /USDT or /USD if already present and user tries to add again
+    if symbol.endswith("/USDT/USDT"):
+        symbol = symbol[:-6]
+    if symbol.endswith("/USD/USD"):
+        symbol = symbol[:-4]
+    # For CCXT exchanges, ensure correct format
+    if exchange.startswith("ccxt:"):
+        # Some exchanges use lowercase, some uppercase, but CCXT is case-insensitive for symbols
+        return symbol
+    # For OKX, always use uppercase and dash for API
+    if exchange == "okx":
+        return symbol.upper()
+    return symbol
+
 def fetch_ohlcv(
     exchange: str,
     symbol: str,
@@ -120,11 +143,11 @@ def fetch_ohlcv(
     Generic OHLCV fetcher for multiple exchanges. Dispatches to the correct per-exchange function.
 
     Args:
-        exchange (str): Exchange name (e.g., 'OKX', 'Blofin', 'MEXC').
+        exchange (str): Exchange name (e.g., 'OKX', 'MEXC').
         symbol (str): Trading pair symbol (e.g., 'BTC/USDT').
         timeframe (str): Timeframe string (e.g., '1m', '1H', etc.).
         limit (int): Number of bars to fetch.
-        use_ws (bool): For exchanges supporting WebSocket (e.g., Blofin), use WS if True.
+        use_ws (bool): For exchanges supporting WebSocket, use WS if True.
         ws_timeout (float): Timeout for WebSocket fetch (if used).
 
     Returns:
@@ -135,7 +158,6 @@ def fetch_ohlcv(
 
     Example:
         >>> fetch_ohlcv('OKX', 'BTC/USDT', '1H', 500)
-        >>> fetch_ohlcv('Blofin', 'BTC/USDT', '1H', 500, use_ws=True)
         >>> fetch_ohlcv('MEXC', 'BTC/USDT', '1H', 500)
 
     To add a new exchange:
@@ -144,19 +166,10 @@ def fetch_ohlcv(
         3. Ensure the function returns List[List[Any]]: [timestamp, open, high, low, close, volume].
     """
     exchange = exchange.strip().lower()
+    symbol = normalize_symbol(symbol, exchange)
     try:
         if exchange == 'okx':
             return fetch_okx_ohlcv(symbol, timeframe, limit)
-        elif exchange == 'blofin':
-            if use_ws:
-                inst_id = symbol.replace('/', '-') + '-SPOT' if not symbol.endswith('-SPOT') else symbol
-                ws_client = BlofinWebSocketClient()
-                return ws_client.fetch_ohlcv(inst_id, bar=timeframe, limit=limit, timeout=ws_timeout)
-            else:
-                inst_id = symbol.replace('/', '-') + '-SPOT' if not symbol.endswith('-SPOT') else symbol
-                return fetch_blofin_ohlcv(inst_id, bar=timeframe, limit=limit)
-        elif exchange == 'mexc':
-            return fetch_mexc_ohlcv(symbol, timeframe, limit)
         elif exchange.startswith('ccxt:'):
             ccxt_exch = exchange.split(':', 1)[1]
             return fetch_ccxt_ohlcv(ccxt_exch, symbol, timeframe, limit)

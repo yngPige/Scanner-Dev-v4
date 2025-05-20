@@ -7,15 +7,11 @@ from dotenv import load_dotenv
 
 load_dotenv()  # Loads variables from .env into os.environ
 
-api_key = os.environ.get("BLOFIN_API_KEY")
-secret = os.environ.get("BLOFIN_SECRET")
-passphrase = os.environ.get("BLOFIN_PASSPHRASE")
-
 logger = logging.getLogger(__name__)
 
 
 def test_api() -> Dict[str, Any]:
-    """Test OKX and Blofin API connectivity and basic public endpoint functionality, including Blofin WebSocket.
+    """Test OKX API connectivity and basic public endpoint functionality.
 
     Returns:
         Dict[str, Any]: Dictionary with status and details of the API test.
@@ -23,7 +19,7 @@ def test_api() -> Dict[str, Any]:
     Example:
         >>> test_api()
     """
-    result = {"okx": {"status": "success", "details": {}}, "blofin": {"status": "success", "details": {}}}
+    result = {"okx": {"status": "success", "details": {}}}
     # OKX Test
     try:
         markets_url = "https://www.okx.com/api/v5/public/instruments?instType=SPOT"
@@ -37,28 +33,6 @@ def test_api() -> Dict[str, Any]:
         logger.error(f"OKX API test failed: {exc}")
         result["okx"]["status"] = "error"
         result["okx"]["details"]["error"] = str(exc)
-    # Blofin Test
-    try:
-        from Data.blofin_oublic_data import fetch_blofin_instruments, fetch_blofin_ticker, BlofinWebSocketClient
-        api_key = os.environ.get("BLOFIN_API_KEY")
-        secret = os.environ.get("BLOFIN_SECRET")
-        passphrase = os.environ.get("BLOFIN_PASSPHRASE")
-        instruments = fetch_blofin_instruments(api_key, secret, passphrase)
-        result["blofin"]["details"]["markets_count"] = len(instruments) if instruments else 0
-        # If fetch_blofin_ticker requires auth, pass credentials
-        try:
-            ticker = fetch_blofin_ticker(api_key, secret, passphrase, 'BTC-USDT-SPOT')
-        except TypeError:
-            ticker = fetch_blofin_ticker('BTC-USDT-SPOT')
-        result["blofin"]["details"]["ticker"] = ticker.get('last') if ticker else None
-        # Test Blofin WebSocket OHLCV
-        ws_client = BlofinWebSocketClient()
-        ws_ohlcv = ws_client.fetch_ohlcv('BTC-USDT-SPOT', bar='1m', limit=5, timeout=5.0)
-        result["blofin"]["details"]["websocket_ohlcv_sample"] = ws_ohlcv[:2] if ws_ohlcv else []
-    except Exception as exc:
-        logger.error(f"Blofin API test failed: {exc}")
-        result["blofin"]["status"] = "error"
-        result["blofin"]["details"]["error"] = str(exc)
     return result
 
 
@@ -103,7 +77,7 @@ def fetch_okx_ticker(symbol: str, all_markets: bool = False) -> Optional[Dict[st
 
 def fetch_okx_ohlcv(symbol: str, timeframe: str = '1m', limit: int = 100) -> Optional[List[List[Any]]]:
     """Fetch OHLCV (Open, High, Low, Close, Volume) data for a symbol from OKX public API."""
-    VALID_BARS = {'1m', '3m', '5m', '15m', '30m', '1H', '4H', '1D', '1W', '1M'}
+    VALID_BARS = {'1m', '3m', '5m', '15m', '30m', '1H', '2H', '4H', '6H', '12H', '1D', '1W', '1M', '3M'}
     if timeframe not in VALID_BARS:
         logger.error(f"Invalid timeframe '{timeframe}'. Must be one of {VALID_BARS}")
         return None
