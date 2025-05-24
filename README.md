@@ -34,7 +34,7 @@
 
 ### 1. **Clone the Repository**
 ```bash
-git clone https://github.com/yngPige/Dev.git
+git clone https://github.com/yngPige/Scanner-Dev-v4.git
 cd "Scanner Dev v4"
 ```
 
