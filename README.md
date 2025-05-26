@@ -27,6 +27,11 @@
 - **Comprehensive ML Analysis Output**: ML results are formatted as a detailed, visually clear HTML summary (tables, color highlights, sections).
 - **Improved Error Handling**: User-friendly error dialogs and feedback for missing/insufficient data.
 - **Extensible**: Modular codebase for adding new exchanges, models, or analytics.
+- **LSTM Stream Output**:
+  - Enhanced, color-coded real-time table (forecast, delta, percent change, uncertainty, trend)
+  - Real-time sparkline chart (forecast, previous close, uncertainty band)
+  - Dark mode toggle for the chart
+  - Resource usage display (CPU, RAM, GPU)
 
 ---
 
@@ -50,6 +55,7 @@ source .venv/bin/activate
 ### 3. **Install Dependencies**
 ```bash
 pip install -r requirements.txt
+pip install pyqtgraph
 ```
 
 ### 4. **(Optional) Install Ollama for LLM Analysis**
@@ -75,6 +81,22 @@ python Features/3lack_gui.py
 ```bash
 pytest tests/
 ```
+
+### **LSTM Stream Output Usage**
+- Click **"Show LSTM Stream Output"** in the main window.
+- The output window displays:
+  - A real-time, color-coded table of LSTM predictions.
+  - A sparkline chart showing forecast, previous close, and uncertainty.
+  - A dark mode toggle for the chart ("Enable Dark Mode").
+  - Resource usage (CPU, RAM, GPU) at the bottom.
+- Use the **Settings** tab to adjust streaming interval, window size, and uncertainty iterations.
+- All features/indicators are always enabled and listed in the settings tab.
+
+## Notes
+
+- Ensure you have a compatible GPU and PyTorch installed for best LSTM performance.
+- If you encounter `ModuleNotFoundError: No module named 'pyqtgraph'`, install it as shown above.
+- For best results, train the LSTM model before starting the stream.
 
 ---
 
