@@ -6,7 +6,7 @@ import os
 from dotenv import load_dotenv
 
 # ML Algorithm selection
-ML_ALGORITHM: str = "RandomForest"  # Options: "RandomForest", "GradientBoosting", "SVM"
+ML_ALGORITHM: str = "RandomForest"  # Options: "RandomForest", "GradientBoosting", "SVM", "LSTM"
 ML_HYPERPARAMETER_TUNING: bool = True
 ML_TRAINING_LOOKBACK: int = 500  # Number of rows to use for training
 ML_PREDICTION_HORIZON: int = 3   # How many periods ahead to predict
@@ -28,6 +28,15 @@ RF_PARAM_GRID: Dict[str, Any] = {
     "min_samples_split": [2, 5, 10],
     "min_samples_leaf": [1, 2, 4],
 }
+
+# LSTM parameters (for regression)
+LSTM_WINDOW: int = 30  # Default window size (can be tuned)
+LSTM_HIDDEN_SIZE: int = 64
+LSTM_NUM_LAYERS: int = 2
+LSTM_DROPOUT: float = 0.2
+LSTM_EPOCHS: int = 30
+LSTM_BATCH_SIZE: int = 32
+LSTM_LR: float = 1e-3
 
 # Trading thresholds
 STOP_LOSS_PERCENTAGE: float = 0.02  # 2% stop loss

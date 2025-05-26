@@ -30,6 +30,7 @@ from typing import Any, Dict, Optional, Callable
 import matplotlib.pyplot as plt
 import subprocess
 import itertools
+from src.analysis.lstm_regressor import LSTMRegressor
 
 warnings.filterwarnings("ignore", category=UserWarning, module="xgboost")
 
@@ -286,7 +287,48 @@ class MLAnalyzer:
         Returns:
             Dictionary with training results
         """
+        import config
         start_time = time.time()
+        if self.algorithm == "LSTM":
+            df = klines_data.copy()
+            # Use all columns except timestamp and close as features
+            feature_cols = [c for c in df.columns if c not in ['timestamp', 'close']]
+            target_col = 'close'
+            data = df[feature_cols].values
+            targets = df[target_col].values
+            window = getattr(config, 'LSTM_WINDOW', 30)
+            # Create windowed dataset
+            X, y = LSTMRegressor.create_windowed_dataset(data, targets, window)
+            if len(X) == 0:
+                return {'error': 'Not enough data for LSTM training', 'timestamp': datetime.now().isoformat()}
+            model = LSTMRegressor(
+                input_size=X.shape[2],
+                hidden_size=getattr(config, 'LSTM_HIDDEN_SIZE', 64),
+                num_layers=getattr(config, 'LSTM_NUM_LAYERS', 2),
+                dropout=getattr(config, 'LSTM_DROPOUT', 0.2)
+            )
+            model.fit(
+                X, y,
+                epochs=getattr(config, 'LSTM_EPOCHS', 30),
+                batch_size=getattr(config, 'LSTM_BATCH_SIZE', 32),
+                lr=getattr(config, 'LSTM_LR', 1e-3),
+                verbose=True
+            )
+            self.model = model
+            self.lstm_window = window
+            # Save model
+            model_path = os.path.join(self.model_dir, f"lstm_regressor.pt")
+            model.save(model_path)
+            # Evaluate on train set (or split for validation)
+            preds = model.predict(X)
+            mse = np.mean((preds - y) ** 2)
+            training_time = time.time() - start_time
+            return {
+                'algorithm': 'LSTM',
+                'mse': mse,
+                'training_time': training_time,
+                'timestamp': datetime.now().isoformat()
+            }
         # Step 1: Feature engineering and cleaning BEFORE split
         klines_data = calculate_technical_indicators(klines_data)
         y, labeled_df = self._prepare_labels(klines_data, horizon=self.prediction_horizon)
@@ -407,7 +449,18 @@ class MLAnalyzer:
                 'error': 'Model not trained',
                 'timestamp': datetime.now().isoformat()
             }
-        # Prepare data (no label needed)
+        # LSTM regression special case
+        if self.algorithm == "LSTM":
+            result = self.predict_regression(klines_data)
+            if result is None:
+                return {
+                    'error': 'Not enough data for LSTM regression',
+                    'timestamp': datetime.now().isoformat()
+                }
+            # Add timestamp for consistency
+            result['timestamp'] = datetime.now().isoformat()
+            return result
+        # Prepare data (no label needed) for classifiers
         try:
             X = klines_data.copy()
             y_pred_proba = self.model.predict_proba(X)
@@ -495,7 +548,10 @@ class MLAnalyzer:
             atr = (recent_data['high'] - recent_data['low']).mean()
 
         # Calculate price volatility as percentage
-        volatility_pct = (atr / current_price) * 100
+        if current_price and np.isfinite(current_price) and current_price != 0:
+            volatility_pct = (atr / current_price) * 100
+        else:
+            volatility_pct = np.nan
 
         # Adjust order spacing based on volatility
         # Higher volatility = wider spacing
@@ -1304,6 +1360,48 @@ class MLAnalyzer:
                 flat = {**params, 'error': str(e)}
                 results.append(flat)
         return pd.DataFrame(results)
+
+    def predict_regression(self, klines_data: pd.DataFrame) -> Optional[dict]:
+        """
+        Predict the next close price using the trained LSTM model, with uncertainty and trend.
+        Args:
+            klines_data (pd.DataFrame): DataFrame with historical features.
+        Returns:
+            Optional[dict]: {
+                'forecast': float,
+                'uncertainty': float,
+                'delta': float,
+                'percent_change': float,
+                'recent_trend': str
+            } or None if not enough data/model not trained.
+        """
+        if self.model is None or not hasattr(self, 'lstm_window'):
+            return None
+        df = klines_data.copy()
+        feature_cols = [c for c in df.columns if c not in ['timestamp', 'close']]
+        data = df[feature_cols].values
+        if len(data) < self.lstm_window:
+            return None
+        X = data[-self.lstm_window:]
+        X = X.reshape(1, self.lstm_window, -1)
+        forecast, uncertainty = self.model.predict_with_uncertainty(X, n_iter=20)
+        last_close = df['close'].iloc[-1]
+        delta = forecast - last_close
+        percent_change = (delta / last_close) * 100 if last_close != 0 else 0.0
+        window_mean = df['close'].iloc[-self.lstm_window:].mean()
+        if last_close > window_mean:
+            trend = "up"
+        elif last_close < window_mean:
+            trend = "down"
+        else:
+            trend = "flat"
+        return {
+            'forecast': float(forecast),
+            'uncertainty': float(uncertainty),
+            'delta': float(delta),
+            'percent_change': float(percent_change),
+            'recent_trend': trend
+        }
 
 def format_ml_training_result(result: dict) -> str:
     lines = []

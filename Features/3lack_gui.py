@@ -10,7 +10,7 @@ import importlib.util
 from typing import Any, List, Optional
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
-    QLabel, QComboBox, QLineEdit, QPushButton, QTextEdit, QTableWidget, QTableWidgetItem, QAbstractItemView, QDoubleSpinBox, QSpinBox, QInputDialog, QMessageBox, QProgressBar, QCompleter, QDialog, QListWidget, QDialogButtonBox, QCheckBox, QTabWidget, QScrollArea, QToolButton, QProgressDialog
+    QLabel, QComboBox, QLineEdit, QPushButton, QTextEdit, QTableWidget, QTableWidgetItem, QAbstractItemView, QDoubleSpinBox, QSpinBox, QInputDialog, QMessageBox, QProgressBar, QCompleter, QDialog, QListWidget, QDialogButtonBox, QCheckBox, QTabWidget, QScrollArea, QToolButton, QProgressDialog, QFormLayout
 )
 from PyQt6.QtCore import Qt, QThread, pyqtSignal, QTimer, QUrl
 from PyQt6.QtGui import QIcon
@@ -36,6 +36,9 @@ import tempfile
 from Data.ccxt_public_data import fetch_ccxt_ohlcv
 import joblib
 from plotly.subplots import make_subplots
+from src.analysis.lstm_stream import LSTMDataStreamer
+import psutil
+import pyqtgraph as pg
 
 load_dotenv()
 
@@ -65,6 +68,16 @@ class MainWindow(QMainWindow):
         self.ml_analyzer = MLAnalyzer()
         self.pair_sources = {}  # Ensure pair_sources is always initialized
         self.ccxt_pair_cache = {}  # Added for caching CCXT pairs
+        # --- Initialize all attributes that may be referenced before assignment ---
+        self.llm_output = None
+        self.analysis_label = None
+        self.pair_menu_widget = None
+        self.chart_window = None
+        self.chart_view = None
+        self.optuna_worker = None
+        self.last_df_hist = None
+        self.last_analysis = None
+        # --- End attribute initialization ---
         self.init_ui()
 
     def init_ui(self):
@@ -86,7 +99,9 @@ class MainWindow(QMainWindow):
 
         # ML Algorithm Selector
         self.algorithm_combo = QComboBox()
-        self.algorithm_combo.addItems(["RandomForest", "GradientBoosting", "SVM", "XGBoost", "Ensemble (Voting)", "Ensemble (Stacking)"])
+        self.algorithm_combo.addItems([
+            "RandomForest", "GradientBoosting", "SVM", "XGBoost", "Ensemble (Voting)", "Ensemble (Stacking)", "LSTM"
+        ])
         self.algorithm_combo.setCurrentText(self.selected_algorithm)
         self.algorithm_combo.currentTextChanged.connect(self.on_algorithm_changed)
         controls_layout.addWidget(QLabel("ML Algorithm:"))
@@ -138,32 +153,6 @@ class MainWindow(QMainWindow):
         self.data_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
         self.data_table.setVisible(False)
 
-        # LLM Output
-        self.llm_output = QTextEdit()
-        self.llm_output.setReadOnly(True)
-        # Enable full text selection and copying for easy copy-paste
-        self.llm_output.setTextInteractionFlags(
-            Qt.TextInteractionFlag.TextSelectableByMouse |
-            Qt.TextInteractionFlag.TextSelectableByKeyboard |
-            Qt.TextInteractionFlag.LinksAccessibleByMouse |
-            Qt.TextInteractionFlag.LinksAccessibleByKeyboard
-        )
-
-        # Test API Button (was OKX API Test Button)
-        self.test_api_button = QPushButton("Test API")
-        self.test_api_button.clicked.connect(self.run_api_test)
-
-        # Download All Timeframes Button
-        self.download_all_button = QPushButton("Download All Timeframes")
-        self.download_all_button.clicked.connect(self.download_all_timeframes_for_selected_pair)
-
-        # Progress Bar
-        self.progress_bar = QProgressBar()
-        self.progress_bar.setMinimum(0)
-        self.progress_bar.setMaximum(100)
-        self.progress_bar.setValue(0)
-        self.progress_bar.setVisible(False)
-
         # Strategy Selector
         self.strategy_combo = QComboBox()
         self.strategy_combo.addItems([
@@ -204,15 +193,30 @@ class MainWindow(QMainWindow):
         main_layout.addWidget(self.train_button)
         main_layout.addWidget(self.run_button)
         main_layout.addWidget(self.feature_report_button)
-        main_layout.addWidget(self.download_all_button)
+        # Progress Bar (must be initialized before adding to layout)
+        self.progress_bar = QProgressBar()
+        self.progress_bar.setVisible(False)
         main_layout.addWidget(self.progress_bar)
         main_layout.addWidget(self.backtest_button)
         main_layout.addWidget(self.show_chart_button)
-        main_layout.addWidget(self.test_api_button)
         main_layout.addWidget(self.current_label)
         main_layout.addWidget(self.reversal_label)  # Add reversal label to layout
-        main_layout.addWidget(QLabel("Analysis & Recommendations:"))
-        main_layout.addWidget(self.llm_output)
+
+        # LSTM Forecast Label
+        self.lstm_forecast_label = QLabel("LSTM Forecast: --")
+        self.lstm_forecast_label.setStyleSheet("font-weight: bold; font-size: 14px;")
+        main_layout.addWidget(self.lstm_forecast_label)
+
+        # LSTM Stream Button
+        self.lstm_stream_button = QPushButton("Start LSTM Stream")
+        self.lstm_stream_button.setCheckable(True)
+        self.lstm_stream_button.toggled.connect(self.toggle_lstm_stream)
+        main_layout.addWidget(self.lstm_stream_button)
+
+        # LSTM Stream Output Button
+        self.lstm_stream_output_button = QPushButton("Show LSTM Stream Output")
+        self.lstm_stream_output_button.clicked.connect(self.show_lstm_stream_output_window)
+        main_layout.addWidget(self.lstm_stream_output_button)
 
         # Set main widget
         container = QWidget()
@@ -239,6 +243,13 @@ class MainWindow(QMainWindow):
         self.data_timestamp_timer.timeout.connect(self.refresh_data_timestamp)
         self.data_timestamp_timer.start(5000)  # 5 seconds
         self.last_data_fetch_time = None
+
+        # --- LSTM Streamer attribute initialization ---
+        self.lstm_streamer = None
+
+        # Output window references
+        self._lstm_stream_output_dialog = None
+        self._lstm_stream_output_table = None
 
     def update_exchange_status(self):
         """Check if OKX exchange is reachable and update the status label."""
@@ -291,9 +302,6 @@ class MainWindow(QMainWindow):
         if not symbol or symbol == "SELECT PAIR":
             self.data_table.setRowCount(0)
             self.data_table.setVisible(False)
-            self.llm_output.setText("Please select a pair.")
-            self.reversal_label.setText("Reversal: --")
-            self.reversal_label.setStyleSheet("color: black; font-weight: bold; font-size: 16px;")
             return
         rows = 1000
         exchange = getattr(self, 'selected_exchange', 'OKX')
@@ -346,7 +354,6 @@ class MainWindow(QMainWindow):
                     self.data_table.setItem(row_idx, col_idx, item)
                 pct_item = QTableWidgetItem(f"{change_pct:.2f}%")
                 self.data_table.setItem(row_idx, 6, pct_item)
-            self.llm_output.setText("")
             self.last_data_fetch_time = datetime.now(timezone.utc)
             self.refresh_data_timestamp()
             # --- Reversal indicator update ---
@@ -363,9 +370,6 @@ class MainWindow(QMainWindow):
         else:
             self.data_table.setRowCount(0)
             self.data_table.setVisible(False)
-            self.llm_output.setText("Failed to fetch OHLCV data. Please check the symbol, timeframe, or your internet connection.")
-            self.reversal_label.setText("Reversal: --")
-            self.reversal_label.setStyleSheet("color: black; font-weight: bold; font-size: 16px;")
 
     def run_analysis(self):
         """Run analysis using MLAnalyzer only."""
@@ -376,7 +380,7 @@ class MainWindow(QMainWindow):
         if custom:
             symbol = f"{custom}"
         else:
-            self.llm_output.setHtml("<b>[Analysis]</b> Please select an exchange and pair.")
+            self.show_analysis_window("<b>[Analysis]</b> Please select an exchange and pair.")
             return
         timeframe = self.timeframe_combo.currentText()
         exchange = getattr(self, 'selected_exchange', 'OKX')
@@ -410,23 +414,25 @@ class MainWindow(QMainWindow):
                 pipeline = joblib.load(model_path_optuna)
                 self.ml_analyzer.pipeline_ = pipeline
             except Exception:
-                self.llm_output.setHtml("<b>[Analysis]</b> Failed to load hyperparameter-tuned model. Using default.")
+                self.show_analysis_window("<b>[Analysis]</b> Failed to load hyperparameter-tuned model. Using default.")
         elif os.path.exists(model_path):
             try:
                 pipeline = joblib.load(model_path)
                 self.ml_analyzer.pipeline_ = pipeline
             except Exception:
-                self.llm_output.setHtml("<b>[Analysis]</b> Failed to load regular model. Using default.")
+                self.show_analysis_window("<b>[Analysis]</b> Failed to load regular model. Using default.")
         # Continue with analysis as before
         from src.utils.data_storage import load_ohlcv
         df_hist = load_ohlcv(symbol, norm_timeframe)
         if df_hist.empty:
-            self.llm_output.setHtml("<b>[Analysis]</b> No historical data available for this symbol/timeframe.")
+            html = "<b>[Analysis]</b> No historical data available for this symbol/timeframe."
+            self.show_analysis_window(html)
             return
         try:
             df_hist = self.add_technical_indicators(df_hist)
         except ValueError as e:
-            self.llm_output.setHtml(f"<b>[Analysis]</b> {e}")
+            html = f"<b>[Analysis]</b> {e}"
+            self.show_analysis_window(html)
             return
         self.ml_analyzer.set_custom_model_class(None)
         output = ""
@@ -434,6 +440,45 @@ class MainWindow(QMainWindow):
         if self.ml_analyzer.algorithm != self.selected_algorithm:
             self.on_algorithm_changed(self.selected_algorithm)
         if mode in ["Machine Learning", "Both"]:
+            if self.selected_algorithm == "LSTM":
+                # Load LSTM model for analysis, auto-train if missing
+                try:
+                    import numpy as np
+                    model_base = f"model_{symbol.replace('/', '-')}_{norm_timeframe}_{self.selected_algorithm}"
+                    model_path = os.path.join("Models", model_base + ".pt")
+                    from src.analysis.lstm_regressor import LSTMRegressor
+                    window = 30  # Use optimal/configurable window size
+                    feature_cols = [c for c in df_hist.columns if c not in ['timestamp', 'close']]
+                    features = df_hist[feature_cols].values.astype(np.float32)
+                    targets = df_hist['close'].values.astype(np.float32)
+                    X, y = LSTMRegressor.create_windowed_dataset(features, targets, window)
+                    input_size = X.shape[2] if X.ndim == 3 else len(feature_cols)
+                    # --- PATCH: Use in-memory model if .pt file is missing ---
+                    model_loaded = False
+                    if os.path.exists(model_path):
+                        model_loaded = True
+                    elif hasattr(self.ml_analyzer, 'model') and isinstance(self.ml_analyzer.model, LSTMRegressor):
+                        # Check if model is trained (has parameters loaded)
+                        model_loaded = True
+                    if not model_loaded:
+                        log_html = f"<b>[Analysis]</b> LSTM model file not found: {model_path}<br>Please train the LSTM model first using the 'Train Model' button."
+                        self.show_analysis_window(log_html, closable=True)
+                        return
+                    forecast_result = self.ml_analyzer.predict_regression(df_hist)
+                    if forecast_result is not None and isinstance(forecast_result, dict):
+                        forecast_val = forecast_result.get('forecast', None)
+                        if forecast_val is not None:
+                            self.lstm_forecast_label.setText(f"LSTM Forecast: {forecast_val:.4f}")
+                            output += f"<b>LSTM Next Close Forecast:</b> <span style='color:blue;font-weight:bold'>{forecast_val:.4f}</span><br>"
+                        else:
+                            self.lstm_forecast_label.setText("LSTM Forecast: --")
+                            output += "<b>LSTM Next Close Forecast:</b> <span style='color:red'>Not enough data or model not trained.</span><br>"
+                    else:
+                        self.lstm_forecast_label.setText("LSTM Forecast: --")
+                        output += "<b>LSTM Next Close Forecast:</b> <span style='color:red'>Not enough data or model not trained.</span><br>"
+                except Exception as e:
+                    self.show_analysis_window(f"<b>[Analysis]</b> Error loading or auto-training LSTM model: {e}")
+                    return
             ml_result = self.ml_analyzer.analyze_market_data(
                 symbol=symbol,
                 klines_data=df_hist,
@@ -447,7 +492,7 @@ class MainWindow(QMainWindow):
                 ohlcv_data = df_hist[["timestamp", "open", "high", "low", "close", "volume"]].values.tolist()
                 llm_result = self.llm_analyze_ohlcv(ohlcv_data)
                 output += "[LLM Analysis]\n" + llm_result
-        self.llm_output.setHtml(output)
+        self.show_analysis_window(output)
         self.last_analysis = ml_result if ml_result and isinstance(ml_result, dict) else None
         self.last_df_hist = df_hist
         # --- Auto-update chart if open and Show Chart is checked ---
@@ -471,8 +516,6 @@ You are a quantitative analyst. Analyze the following OHLCV (Open, High, Low, Cl
 - Key technical indicator values (RSI, MACD, moving averages, volatility, etc.)
 - Notable support and resistance levels
 - Any significant patterns or anomalies in the data
-
-Do NOT provide trading recommendations, entry/exit prices, or any rationale for action. Do NOT include verbose explanations or general advice. Only summarize the technical state of the market in a factual, data-driven manner.
 
 <b>ML Metrics:</b><br>{ml_metrics_html}
 <b>OHLCV Data:</b><br><pre>
@@ -522,499 +565,6 @@ Do NOT provide trading recommendations, entry/exit prices, or any rationale for 
         # Display the formatted result in the LLM output box
         self.llm_output.setHtml(f"<b>LLM ({ollama_model}) Technical Summary:</b><br>{llm_response}")
         return llm_response
-
-    def run_api_test(self):
-        """Test OKX and Blofin API endpoints and display results in the LLM output box."""
-        from Data.okx_public_data import test_api
-        import pprint
-        self.update_exchange_status()
-        result = test_api()
-        html = "<b>API Connectivity Test Results</b><br>"
-        for ex, ex_result in result.items():
-            html += f"<b>{ex.upper()}:</b> Status: {ex_result['status']}<br>"
-            for k, v in ex_result['details'].items():
-                html += f"&nbsp;&nbsp;<b>{k}:</b> {pprint.pformat(v)}<br>"
-        self.llm_output.setHtml(html)
-
-    def ohlcv_to_df(self, ohlcv_data):
-        # ohlcv_data: List[List[str]] (from table)
-        df = pd.DataFrame(ohlcv_data, columns=["Timestamp", "Open", "High", "Low", "Close", "Volume"])
-        # Convert numeric columns
-        for col in ["Open", "High", "Low", "Close", "Volume"]:
-            df[col] = pd.to_numeric(df[col], errors="coerce")
-        # Convert timestamp to numeric if needed
-        return df
-
-    def format_ml_analysis_html(self, result: dict) -> str:
-        """
-        Format the ML analysis result as a comprehensive, visually clear HTML summary for display, using a structured HTML list. Exclude Direction and Price Action.
-        """
-        if not isinstance(result, dict):
-            return f"<b>[ML Analysis]</b> Invalid result."
-        if 'error' in result:
-            return f"<b>[ML Analysis Error]</b> {result['error']}"
-        def color_for_recommendation(rec):
-            return 'green' if rec == 'BUY' else 'red' if rec == 'SELL' else 'gray'
-        def color_for_sentiment(sent):
-            return 'green' if sent == 'BULLISH' else 'red' if sent == 'BEARISH' else 'gray'
-        def fmt_price(val):
-            try:
-                return f"{float(val):,.4f}"
-            except Exception:
-                return str(val)
-        html = "<ul style='font-family:Arial,sans-serif;font-size:13px;'>"
-        html += f"<li><b>Recommendation:</b> <span style='color:{color_for_recommendation(result.get('recommendation'))};font-weight:bold'>{result.get('recommendation','')}</span></li>"
-        html += f"<li><b>Confidence:</b> <span style='color:gold;font-weight:bold'>{result.get('confidence',0):.2f}%</span></li>"
-        html += f"<li><b>Current Price:</b> <span style='color:gold;font-weight:bold'>{fmt_price(result.get('current_price','N/A'))}</span></li>"
-        html += f"<li><b>Sentiment:</b> <span style='color:{color_for_sentiment(result.get('metrics',{}).get('market_sentiment',''))};'>{result.get('metrics',{}).get('market_sentiment','N/A')}</span></li>"
-        html += f"<li><b>Timeframe Suitability:</b> {result.get('metrics',{}).get('timeframe_suitability','N/A')}</li>"
-        # Support/Resistance
-        support_levels = ', '.join(fmt_price(s) for s in result.get('support_levels', []))
-        resistance_levels = ', '.join(fmt_price(r) for r in result.get('resistance_levels', []))
-        html += f"<li><b>Support Levels:</b> {support_levels}</li>"
-        html += f"<li><b>Resistance Levels:</b> {resistance_levels}</li>"
-        # Limit Orders (condensed)
-        lo = result.get('limit_orders', {})
-        if lo:
-            orders = []
-            for order_type in ['entry', 'take_profit', 'stop_loss']:
-                for o in lo.get(order_type, []):
-                    confidence = str(o.get('confidence', '')).upper()
-                    if confidence == 'LOW':
-                        continue
-                    orders.append(f"{order_type.title()}: {o.get('type','')} @ {fmt_price(o.get('price',''))} ({confidence})")
-            if orders:
-                html += "<li><b>Orders:</b><ul>"
-                for order in orders:
-                    html += f"<li>{order}</li>"
-                html += "</ul></li>"
-        html += "</ul>"
-        return html
-
-    def add_technical_indicators(self, df: pd.DataFrame, min_rows: int = 35) -> pd.DataFrame:
-        """
-        Add a suite of technical indicators to the OHLCV DataFrame using pandas_ta default column names for all indicators.
-        """
-        import pandas_ta as ta
-        import numpy as np
-        import pandas as pd
-        if df.empty or not all(col in df.columns for col in ['open', 'high', 'low', 'close', 'volume']):
-            raise ValueError("DataFrame is empty or missing required OHLCV columns.")
-        if df['close'].isnull().all():
-            raise ValueError("No valid 'close' price data available for indicator calculation.")
-        df = df.rename(columns={col: col.lower() for col in df.columns})
-        # --- Standard indicators ---
-        indicators = [
-            ta.ema(df['close'], length=9),
-            ta.ema(df['close'], length=20),
-            ta.ema(df['close'], length=50),
-            ta.ema(df['close'], length=100),
-            ta.macd(df['close']),
-            ta.adx(df['high'], df['low'], df['close']),
-            ta.rsi(df['close'], length=14),
-            ta.stoch(df['high'], df['low'], df['close']),
-            ta.willr(df['high'], df['low'], df['close'], length=14),
-            ta.cci(df['high'], df['low'], df['close'], length=20),
-            ta.roc(df['close'], length=12),
-            ta.mfi(df['high'], df['low'], df['close'], df['volume'], length=14),
-            ta.bbands(df['close'], length=20),
-            ta.atr(df['high'], df['low'], df['close'], length=14),
-            ta.obv(df['close'], df['volume']),
-            ta.cmf(df['high'], df['low'], df['close'], df['volume'], length=20),
-        ]
-        for ind in indicators:
-            if ind is not None:
-                df = pd.concat([df, ind], axis=1)
-        # --- Advanced features ---
-        # Candle pattern flags
-        candle_patterns = ['cdl_engulfing', 'cdl_hammer', 'cdl_doji', 'cdl_morningstar', 'cdl_eveningstar']
-        for pat in candle_patterns:
-            try:
-                df[pat] = getattr(ta, pat)(df['open'], df['high'], df['low'], df['close'])
-            except Exception:
-                df[pat] = 0
-        # Rolling returns and volatility
-        df['return_1'] = df['close'].pct_change(1)
-        df['return_5'] = df['close'].pct_change(5)
-        df['volatility_5'] = df['close'].rolling(5).std()
-        df['volatility_20'] = df['close'].rolling(20).std()
-        # Price/MA ratios
-        df['close_ema9_ratio'] = df['close'] / df['close'].ewm(span=9, adjust=False).mean()
-        df['close_ema20_ratio'] = df['close'] / df['close'].ewm(span=20, adjust=False).mean()
-        # Time-of-day features
-        if isinstance(df.index, pd.DatetimeIndex):
-            df['hour'] = df.index.hour
-            df['dayofweek'] = df.index.dayofweek
-        else:
-            df['hour'] = 0
-            df['dayofweek'] = 0
-        # --- More advanced features ---
-        # SuperTrend
-        try:
-            st = ta.supertrend(df['high'], df['low'], df['close'])
-            if isinstance(st, pd.DataFrame):
-                df['supertrend'] = st.iloc[:, 0]
-        except Exception:
-            df['supertrend'] = 0
-        # Keltner Channel width
-        try:
-            kc = ta.kc(df['high'], df['low'], df['close'])
-            if isinstance(kc, pd.DataFrame):
-                df['kc_width'] = kc['KCU_20_2.0'] - kc['KCL_20_2.0']
-        except Exception:
-            df['kc_width'] = 0
-        # Donchian Channel breakout
-        try:
-            dc = ta.donchian(df['high'], df['low'], lower_length=20, upper_length=20)
-            if isinstance(dc, pd.DataFrame):
-                df['donchian_breakout'] = (df['close'] >= dc['DONCHIANU_20_20']).astype(int) - (df['close'] <= dc['DONCHIANL_20_20']).astype(int)
-        except Exception:
-            df['donchian_breakout'] = 0
-        # TRIX
-        try:
-            df['trix'] = ta.trix(df['close'])
-        except Exception:
-            df['trix'] = 0
-        # Ultimate Oscillator
-        try:
-            df['uo'] = ta.uo(df['high'], df['low'], df['close'])
-        except Exception:
-            df['uo'] = 0
-        # Z-Score of price
-        df['zscore_close'] = (df['close'] - df['close'].rolling(20).mean()) / df['close'].rolling(20).std()
-        # Pivot Points (Classic)
-        try:
-            pivots = ta.pivot('classic', df['high'], df['low'], df['close'])
-            if isinstance(pivots, pd.DataFrame):
-                df['pivot'] = pivots['P']
-        except Exception:
-            df['pivot'] = 0
-        # Fractals
-        try:
-            fr = ta.fractals(df['high'], df['low'])
-            if isinstance(fr, pd.DataFrame):
-                df['fractal_high'] = fr['FRACTALS_HI_2']
-                df['fractal_low'] = fr['FRACTALS_LO_2']
-        except Exception:
-            df['fractal_high'] = 0
-            df['fractal_low'] = 0
-        # Distance to recent high/low
-        df['dist_to_high'] = df['close'] / df['high'].rolling(20).max() - 1
-        df['dist_to_low'] = df['close'] / df['low'].rolling(20).min() - 1
-        # Consecutive up/down closes
-        df['consec_up'] = (df['close'] > df['close'].shift(1)).astype(int).groupby((df['close'] <= df['close'].shift(1)).cumsum()).cumsum()
-        df['consec_down'] = (df['close'] < df['close'].shift(1)).astype(int).groupby((df['close'] >= df['close'].shift(1)).cumsum()).cumsum()
-        # Volume spike flag
-        df['vol_spike'] = (df['volume'] > 2 * df['volume'].rolling(20).mean()).astype(int)
-        # Rolling Sharpe ratio
-        df['rolling_sharpe'] = df['return_1'].rolling(20).mean() / (df['return_1'].rolling(20).std() + 1e-9)
-        # Is weekend
-        if isinstance(df.index, pd.DatetimeIndex):
-            df['is_weekend'] = df.index.dayofweek >= 5
-        else:
-            df['is_weekend'] = 0
-        df = df.dropna().reset_index(drop=True)
-        valid_rows = len(df.dropna(subset=["open", "high", "low", "close", "volume"]))
-        if valid_rows < min_rows:
-            raise ValueError(f"Not enough valid data for indicator calculation. At least {min_rows} rows are required after cleaning. Valid rows: {valid_rows}")
-        return df
-
-    def train_model(self):
-        from PyQt6.QtWidgets import QMessageBox, QProgressDialog
-        from PyQt6.QtCore import QThread, pyqtSignal, QObject
-        import os
-        import joblib
-        # Use a default or dynamically determined rows value
-        rows = 1000  # Default value, or compute based on timeframe/algorithm if needed
-        custom = self.select_pair_button.text().strip().upper()
-        if custom:
-            symbol = f"{custom}/USDT"
-        else:
-            self.llm_output.append("<b>[ML Training]</b> Please enter a symbol (e.g., BTC) in the Pair field.")
-            return
-        timeframe = self.timeframe_combo.currentText()
-        exchange = getattr(self, 'selected_exchange', 'OKX')
-        # Normalize timeframe for CCXT
-        if str(exchange).lower().startswith("ccxt:"):
-            ccxt_name = str(exchange).split(":", 1)[1]
-            norm_timeframe = self.get_ccxt_timeframe(ccxt_name, timeframe)
-        else:
-            norm_timeframe = self.timeframe_map.get(timeframe, timeframe)
-        indicator_lookback = max([100, 26, 20, 14])
-        min_required_rows = rows + indicator_lookback
-        from src.utils.helpers import fetch_ohlcv
-        ohlcv = fetch_ohlcv(exchange, symbol, norm_timeframe, limit=min_required_rows)
-        from src.utils.data_storage import save_ohlcv, load_ohlcv
-        df_hist = None
-        if ohlcv:
-            save_ohlcv(symbol, norm_timeframe, ohlcv)
-            df_hist = load_ohlcv(symbol, norm_timeframe)
-        else:
-            df_hist = pd.DataFrame()
-        if df_hist.empty:
-            self.llm_output.setHtml("<b>[ML Training]</b> No historical data available for this symbol/timeframe.")
-            return
-        valid_rows = len(df_hist.dropna(subset=["open", "high", "low", "close", "volume"]))
-        if valid_rows < indicator_lookback:
-            self.llm_output.setHtml(
-                f"<b>[ML Training]</b> Not enough valid data for indicator calculation. At least {indicator_lookback} rows are required after cleaning. Valid rows: {valid_rows}"
-            )
-            return
-        usable_rows = min(rows, valid_rows - indicator_lookback)
-        if usable_rows < 1:
-            self.llm_output.setHtml(
-                f"<b>[ML Training]</b> Not enough data after indicator lookback. Try lowering the rows setting or using a higher timeframe."
-            )
-            return
-        if usable_rows < rows:
-            self.llm_output.append(
-                f"<b>[ML Training]</b> Only {usable_rows} rows available for training after indicator calculation. Proceeding with available data."
-            )
-        try:
-            df_hist = self.add_technical_indicators(df_hist, min_rows=usable_rows)
-        except ValueError as e:
-            self.llm_output.setHtml(f"<b>[ML Training]</b> {e}")
-            return
-        self.ml_analyzer.set_custom_model_class(None)
-        # --- Prompt for hyperparameter tuning if supported ---
-        model_base = f"model_{symbol.replace('/', '-')}_{norm_timeframe}_{self.selected_algorithm}"
-        model_path = os.path.join("Models", model_base + ".pkl")
-        model_path_optuna = os.path.join("ModelsOptuna", model_base + ".pkl")
-        os.makedirs(os.path.dirname(model_path), exist_ok=True)
-        os.makedirs(os.path.dirname(model_path_optuna), exist_ok=True)
-        if "Ensemble" not in self.selected_algorithm:
-            reply = QMessageBox.question(self, "Hyperparameter Tuning", "Do you want to run Optuna hyperparameter tuning?", QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
-            if reply == QMessageBox.StandardButton.Yes:
-                class OptunaWorker(QThread):
-                    result_ready = pyqtSignal(object)
-                    error_occurred = pyqtSignal(str)
-                    def __init__(self, analyzer, df, model_type):
-                        super().__init__()
-                        self.analyzer = analyzer
-                        self.df = df
-                        self.model_type = model_type
-                        self._cancel = False
-                    def run(self):
-                        try:
-                            study = self.analyzer.optimize_with_optuna(self.df, model_type=self.model_type, n_trials=20)
-                            if self._cancel:
-                                return
-                            self.result_ready.emit(study)
-                        except Exception as e:
-                            self.error_occurred.emit(str(e))
-                    def cancel(self):
-                        self._cancel = True
-                progress = QProgressDialog("Running Optuna hyperparameter tuning...", "Cancel", 0, 0, self)
-                progress.setWindowTitle("Hyperparameter Tuning")
-                progress.setWindowModality(Qt.WindowModality.ApplicationModal)
-                progress.setMinimumDuration(0)
-                progress.setValue(0)
-                progress.setCancelButtonText("Cancel")
-                progress.show()
-                self.optuna_worker = OptunaWorker(self.ml_analyzer, df_hist, self.selected_algorithm)
-                def on_result(study):
-                    progress.close()
-                    best_trial = study.best_trial
-                    best_params = best_trial.params
-                    best_score = best_trial.value
-                    # Save the Optuna-tuned model
-                    try:
-                        if hasattr(self.ml_analyzer, 'pipeline_'):
-                            joblib.dump(self.ml_analyzer.pipeline_, model_path_optuna)
-                            self.llm_output.append(f"<b>[ML Training]</b> Hyperparameter-tuned model saved to {model_path_optuna}")
-                        else:
-                            self.llm_output.append("<b>[ML Training]</b> Warning: No pipeline_ attribute found after Optuna tuning.")
-                    except Exception as e:
-                        self.llm_output.append(f"<b>[ML Training]</b> Error saving Optuna-tuned model: {e}")
-                    html = f"""
-                    <div style='font-family:Arial,sans-serif;'>
-                    <h2 style='margin-bottom:0;'>Optuna Hyperparameter Tuning Results</h2>
-                    <b>Algorithm:</b> {self.selected_algorithm}<br>
-                    <b>Best Score (Accuracy):</b> <span style='color:green;font-weight:bold;'>{best_score:.4f}</span><br>
-                    <b>Best Hyperparameters:</b><br>
-                    <ul>
-                    {''.join(f'<li><b>{k}:</b> {v}</li>' for k, v in best_params.items())}
-                    </ul>
-                    <b>Timestamp:</b> {datetime.now().isoformat()}<br>
-                    <hr style='margin:8px 0;'>
-                    </div>
-                    """
-                    self.llm_output.setHtml(html)
-                def on_error(msg):
-                    progress.close()
-                    self.llm_output.setHtml(f"<b>[ML Training]</b> Error during tuning: {msg}")
-                self.optuna_worker.result_ready.connect(on_result)
-                self.optuna_worker.error_occurred.connect(on_error)
-                progress.canceled.connect(self.optuna_worker.cancel)
-                self.optuna_worker.start()
-                return
-        # --- Standard training ---
-        results = self.ml_analyzer.train_model(df_hist)
-        # Save the regular model
-        try:
-            if hasattr(self.ml_analyzer, 'pipeline_'):
-                joblib.dump(self.ml_analyzer.pipeline_, model_path)
-                self.llm_output.append(f"<b>[ML Training]</b> Regular model saved to {model_path}")
-            else:
-                self.llm_output.append("<b>[ML Training]</b> Warning: No pipeline_ attribute found after training.")
-        except Exception as e:
-            self.llm_output.append(f"<b>[ML Training]</b> Error saving regular model: {e}")
-        self.llm_output.setHtml(self.format_ml_training_result_html(results))
-
-    def format_ml_training_result_html(self, result: dict) -> str:
-        """
-        Format the ML training result as a human-friendly HTML summary for display, with color-coded metrics.
-        Args:
-            result (dict): The result dictionary from model training.
-        Returns:
-            str: HTML-formatted summary.
-        """
-        if not isinstance(result, dict):
-            return "<b>[ML Training]</b> Invalid result."
-        if 'error' in result:
-            return f"<b>[ML Training Error]</b> {result['error']}"
-
-        def color_metric(val: float) -> str:
-            if val >= 0.8:
-                return 'green'
-            elif val >= 0.6:
-                return 'gold'
-            else:
-                return 'red'
-
-        html = "<ul style='font-family:Arial,sans-serif;font-size:13px;'>"
-        for k, v in result.items():
-            if isinstance(v, float):
-                html += f"<li><b>{k.replace('_', ' ').capitalize()}:</b> <span style='color:{color_metric(v)};font-weight:bold'>{v:.4f}</span></li>"
-            elif isinstance(v, int):
-                html += f"<li><b>{k.replace('_', ' ').capitalize()}:</b> <span style='color:gold;font-weight:bold'>{v:,}</span></li>"
-            elif isinstance(v, dict):
-                html += f"<li><b>{k.replace('_', ' ').capitalize()}:</b><ul>"
-                for k2, v2 in v.items():
-                    html += f"<li>{k2}: {v2}</li>"
-                html += "</ul></li>"
-            elif isinstance(v, list) and v and all(isinstance(x, (float, int)) for x in v):
-                formatted = ', '.join(f"{x:.4f}" for x in v)
-                html += f"<li><b>{k.replace('_', ' ').capitalize()}:</b> <span style='font-family:monospace'>{formatted}</span></li>"
-            else:
-                html += f"<li><b>{k.replace('_', ' ').capitalize()}:</b> {v}</li>"
-        html += "</ul>"
-        return html
-
-    def show_pair_menu(self):
-        # Toggle: If the menu is already open, close it
-        if hasattr(self, 'pair_menu_widget') and self.pair_menu_widget is not None:
-            self.centralWidget().layout().removeWidget(self.pair_menu_widget)
-            self.pair_menu_widget.deleteLater()
-            self.pair_menu_widget = None
-            self.data_table.setVisible(True)
-            return
-
-        from Data.okx_public_data import fetch_okx_ticker
-        # Hide the data table
-        self.data_table.setVisible(False)
-        # Create the pair menu widget
-        self.pair_menu_widget = QWidget()
-        layout = QVBoxLayout()
-        # Add search bar
-        self.pair_search_input = QLineEdit()
-        self.pair_search_input.setPlaceholderText("Search pairs...")
-        layout.addWidget(self.pair_search_input)
-        self.pair_list = QListWidget()
-        layout.addWidget(QLabel("Select a Pair:"))
-        layout.addWidget(self.pair_list)
-        self.ccxt_exchanges = ["binanceus", "okx", "kraken", "bybit", "kucoin"]
-        self.exchange_combo = QComboBox()
-        self.exchange_combo.addItems(["All", "OKX"] + [f"CCXT:{exch}" for exch in self.ccxt_exchanges])
-        layout.addWidget(QLabel("Exchange:"))
-        layout.addWidget(self.exchange_combo)
-        self.pair_menu_widget.setLayout(layout)
-        # Add to main layout (assume it's the parent of data_table)
-        self.centralWidget().layout().addWidget(self.pair_menu_widget)
-        # Fetch OKX pairs
-        okx_pairs = set()
-        try:
-            tickers = fetch_okx_ticker(None, all_markets=True)
-            okx_pairs = set(
-                t['instId'].replace("-", "/")
-                for t in tickers if 'instId' in t and t['instId'].endswith('-USDT')
-            )
-        except Exception as e:
-            okx_pairs = set([f"Error loading OKX pairs: {e}"])
-        # Merge and mark source (do not fetch CCXT pairs here)
-        all_pairs_set = okx_pairs
-        self.pair_sources = {}
-        for p in all_pairs_set:
-            srcs = []
-            if p in okx_pairs:
-                srcs.append("OKX")
-            self.pair_sources[p] = srcs
-        # Display as: BTC/USDT [OKX]
-        self.all_pairs = [f"{p} [{','.join(self.pair_sources[p])}]" for p in sorted(all_pairs_set)]
-        self.pair_list.addItems(self.all_pairs)
-        self.pair_list.itemClicked.connect(self.select_pair_from_menu)
-        self.pair_search_input.textChanged.connect(self.filter_pair_list)
-        self.exchange_combo.currentTextChanged.connect(lambda: self.filter_pair_list(self.pair_search_input.text()))
-
-    def filter_pair_list(self, text: str) -> None:
-        if not hasattr(self, 'pair_list') or not hasattr(self, 'all_pairs'):
-            return
-        search_text = text.strip().lower()
-        selected_exchange = self.exchange_combo.currentText() if hasattr(self, 'exchange_combo') else "All"
-        self.pair_list.clear()
-        # If a CCXT exchange is selected, dynamically load its pairs
-        if selected_exchange.startswith("CCXT:"):
-            ccxt_name = selected_exchange.split(":", 1)[1]
-            ccxt_pairs = self.get_ccxt_pairs(ccxt_name)
-            for pair in sorted(ccxt_pairs):
-                if search_text and search_text not in pair.lower():
-                    continue
-                self.pair_list.addItem(f"{pair} [CCXT:{ccxt_name}]")
-            return
-        # Otherwise, filter the preloaded pairs
-        for label in self.all_pairs:
-            pair = label.split('[')[0].strip().lower()
-            srcs = label.split('[')[-1].strip('] ').split(',') if '[' in label else []
-            if search_text and search_text not in pair:
-                continue
-            if selected_exchange != "All" and selected_exchange not in srcs:
-                continue
-            self.pair_list.addItem(label)
-
-    def select_pair_from_menu(self, item):
-        label = item.text()
-        # Parse pair and exchange(s)
-        if "[" in label:
-            pair, src = label.split("[")
-            pair = pair.strip()
-            srcs = src.strip("] ").split(",")
-            # Prefer OKX if available, else CCXT
-            if "OKX" in srcs:
-                self.selected_exchange = "OKX"
-            elif any(s.startswith("CCXT:") for s in srcs):
-                ccxt_src = next(s for s in srcs if s.startswith("CCXT:"))
-                self.selected_exchange = ccxt_src.lower()
-            else:
-                self.selected_exchange = "OKX"
-            self.selected_pair = pair  # Store the actual symbol as shown in CCXT or other exchanges
-        else:
-            pair = label.strip()
-            # If the label is from a CCXT dynamic load, set selected_exchange accordingly
-            if "[CCXT:" in label:
-                ccxt_src = label.split("[CCXT:")[-1].strip("] ")
-                self.selected_exchange = f"ccxt:{ccxt_src.lower()}"
-                self.selected_pair = pair  # Store the actual symbol
-            else:
-                self.selected_exchange = "OKX"
-                self.selected_pair = pair
-        self.select_pair_button.setText(pair)
-        # Remove the menu and restore the data table
-        self.centralWidget().layout().removeWidget(self.pair_menu_widget)
-        self.pair_menu_widget.deleteLater()
-        self.pair_menu_widget = None  # Ensure reference is cleared
-        self.data_table.setVisible(True)
-        # Automatically fetch data for the selected pair
-        self.fetch_data()
 
     def run_backtest(self):
         custom = self.select_pair_button.text().strip().upper()
@@ -1343,7 +893,7 @@ Do NOT provide trading recommendations, entry/exit prices, or any rationale for 
         config.ML_ALGORITHM = algorithm  # Update global config
         self.ml_analyzer = MLAnalyzer()  # Recreate analyzer with new config
 
-    def download_all_timeframes_for_selected_pair(self):
+    def download_all_timeframes_for_selected_pair(self, auto=False):
         """
         Download at least a month (30 days) of OHLCV data for all supported timeframes for the selected pair from OKX or CCXT exchanges.
         Skip timeframes if recent data is already downloaded.
@@ -1354,8 +904,10 @@ Do NOT provide trading recommendations, entry/exit prices, or any rationale for 
         import time
         from datetime import datetime, timezone, timedelta
         pair = self.select_pair_button.text().strip().upper()
+        log_html = ""  # Accumulate log messages here
         if not pair or pair == "SELECT PAIR":
-            self.llm_output.append("<b>[Download]</b> Please select a pair first.")
+            log_html += "<b>[Download]</b> Please select a pair first.<br>"
+            self.show_analysis_window(log_html)
             return
         # Define timeframes for both OKX and CCXT
         timeframes = ["5m", "15m", "30m", "1h", "4h", "1d"]
@@ -1378,8 +930,9 @@ Do NOT provide trading recommendations, entry/exit prices, or any rationale for 
                 return fetch_ccxt_ohlcv(ccxt_name, symbol, norm_tf, limit)
             exchange_label = ccxt_name.upper()
         else:
-            self.llm_output.append(f"<b>[Download]</b> Exchange {exchange} not supported for bulk download.")
+            log_html += f"<b>[Download]</b> Exchange {exchange} not supported for bulk download.<br>"
             self.progress_bar.setVisible(False)
+            self.show_analysis_window(log_html)
             return
         for idx, tf in enumerate(timeframes):
             limit = bars_per_month.get(tf, 30)
@@ -1398,7 +951,7 @@ Do NOT provide trading recommendations, entry/exit prices, or any rationale for 
                 if (now - last_dt) < timedelta(hours=24):
                     skip = True
             if skip:
-                self.llm_output.append(f"<b>[Download]</b> Skipping {pair} ({tf}) [{exchange_label}] - already downloaded and recent.")
+                log_html += f"<b>[Download]</b> Skipping {pair} ({tf}) [{exchange_label}] - already downloaded and recent.<br>"
                 # Smooth progress bar animation for skipped
                 current_val = self.progress_bar.value()
                 target_val = current_val + 1
@@ -1408,14 +961,14 @@ Do NOT provide trading recommendations, entry/exit prices, or any rationale for 
                     QApplication.processEvents()
                     time.sleep(0.01)
                 continue
-            self.llm_output.append(f"<b>[Download]</b> Downloading {limit} rows for {pair} ({tf}) from {exchange_label}...")
+            log_html += f"<b>[Download]</b> Downloading {limit} rows for {pair} ({tf}) from {exchange_label}...<br>"
             QApplication.processEvents()
             ohlcv = fetch_func(pair, tf, limit=limit)
             if ohlcv:
                 save_ohlcv(pair, tf, ohlcv)
-                self.llm_output.append(f"<b>[Download]</b> Saved {len(ohlcv)} rows for {pair} ({tf}) [{exchange_label}]")
+                log_html += f"<b>[Download]</b> Saved {len(ohlcv)} rows for {pair} ({tf}) [{exchange_label}]<br>"
             else:
-                self.llm_output.append(f"<b>[Download]</b> Failed to fetch data for {pair} ({tf}) [{exchange_label}]")
+                log_html += f"<b>[Download]</b> Failed to fetch data for {pair} ({tf}) [{exchange_label}]<br>"
             # Smooth progress bar animation
             current_val = self.progress_bar.value()
             target_val = current_val + 1
@@ -1425,7 +978,8 @@ Do NOT provide trading recommendations, entry/exit prices, or any rationale for 
                 QApplication.processEvents()
                 time.sleep(0.03)
         self.progress_bar.setVisible(False)
-        self.llm_output.append(f"<b>[Download]</b> A month of all timeframes downloaded for {pair} ({exchange_label}).")
+        log_html += f"<b>[Download]</b> A month of all timeframes downloaded for {pair} ({exchange_label}).<br>"
+        self.show_analysis_window(log_html)
 
     def toggle_chart_window(self, checked: bool):
         """
@@ -1725,19 +1279,73 @@ Do NOT provide trading recommendations, entry/exit prices, or any rationale for 
         else:
             self.data_timestamp_label.setText("<b>Last Data Fetch:</b> --")
 
-    def detect_reversal(self, ohlcv: list) -> str:
+    def detect_reversal(self, ohlcv: list[list[float]]) -> str:
         """
-        Simple reversal detection using last 3 candles (bullish/bearish engulfing).
-        Returns: 'bullish', 'bearish', or 'none'
+        Detects reversal patterns in OHLCV data using the last 3 candles.
+        Supports multiple patterns (bullish/bearish engulfing, hammer, shooting star, etc.).
+
+        Args:
+            ohlcv (list[list[float]]): List of OHLCV rows, each as [timestamp, open, high, low, close, volume, ...].
+
+        Returns:
+            str: Detected reversal type ('bullish', 'bearish', or 'none').
+
+        Raises:
+            ValueError: If ohlcv is not a list of lists or has insufficient data.
+
+        Example:
+            >>> candles = [[...], [...], [...]]
+            >>> self.detect_reversal(candles)
         """
-        if len(ohlcv) < 3:
+        if not isinstance(ohlcv, list) or len(ohlcv) < 3:
             return 'none'
+        for row in ohlcv[-3:]:
+            if not (isinstance(row, list) and len(row) >= 5):
+                return 'none'
         prev2, prev1, last = ohlcv[-3], ohlcv[-2], ohlcv[-1]
-        # Bullish engulfing: last close > last open, last open < prev1 close, last close > prev1 open
+        patterns = [
+            self._is_bullish_engulfing,
+            self._is_bearish_engulfing,
+            self._is_hammer,
+            self._is_shooting_star
+        ]
+        for pattern_func in patterns:
+            result = pattern_func(prev2, prev1, last)
+            if result != 'none':
+                return result
+        return 'none'
+
+    def _is_bullish_engulfing(self, prev2: list[float], prev1: list[float], last: list[float]) -> str:
+        """Detect bullish engulfing pattern."""
+        # last close > last open, last open < prev1 close, last close > prev1 open
         if last[4] > last[1] and last[1] < prev1[4] and last[4] > prev1[1]:
             return 'bullish'
-        # Bearish engulfing: last close < last open, last open > prev1 close, last close < prev1 open
+        return 'none'
+
+    def _is_bearish_engulfing(self, prev2: list[float], prev1: list[float], last: list[float]) -> str:
+        """Detect bearish engulfing pattern."""
+        # last close < last open, last open > prev1 close, last close < prev1 open
         if last[4] < last[1] and last[1] > prev1[4] and last[4] < prev1[1]:
+            return 'bearish'
+        return 'none'
+
+    def _is_hammer(self, prev2: list[float], prev1: list[float], last: list[float]) -> str:
+        """Detect hammer pattern (bullish reversal)."""
+        open_, high, low, close = last[1], last[2], last[3], last[4]
+        body = abs(close - open_)
+        lower_shadow = open_ - low if open_ > low else close - low
+        upper_shadow = high - max(open_, close)
+        if body > 0 and lower_shadow > 2 * body and upper_shadow < body:
+            return 'bullish'
+        return 'none'
+
+    def _is_shooting_star(self, prev2: list[float], prev1: list[float], last: list[float]) -> str:
+        """Detect shooting star pattern (bearish reversal)."""
+        open_, high, low, close = last[1], last[2], last[3], last[4]
+        body = abs(close - open_)
+        upper_shadow = high - max(open_, close)
+        lower_shadow = min(open_, close) - low
+        if body > 0 and upper_shadow > 2 * body and lower_shadow < body:
             return 'bearish'
         return 'none'
 
@@ -1772,7 +1380,10 @@ Do NOT provide trading recommendations, entry/exit prices, or any rationale for 
         """
         Run training and then analysis in sequence. If Optuna tuning is selected, run analysis only after tuning completes.
         Disable the Run button while running to prevent duplicate runs.
+        Before running, ensure all timeframes are downloaded if not already present.
         """
+        # Download all timeframes for the selected pair if not already downloaded
+        self.download_all_timeframes_for_selected_pair(auto=True)
         self.run_button.setEnabled(False)
         self._run_analysis_after_training = False
         def after_analysis():
@@ -1792,11 +1403,13 @@ Do NOT provide trading recommendations, entry/exit prices, or any rationale for 
             import os
             import joblib
             rows = 1000
+            log_html = ""  # Accumulate log messages here
             custom = self.select_pair_button.text().strip().upper()
             if custom:
                 symbol = f"{custom}/USDT"
             else:
-                self.llm_output.append("<b>[ML Training]</b> Please enter a symbol (e.g., BTC) in the Pair field.")
+                log_html += "<b>[ML Training]</b> Please enter a symbol (e.g., BTC) in the Pair field.<br>"
+                self.show_analysis_window(log_html)
                 after_analysis()
                 return
             timeframe = self.timeframe_combo.currentText()
@@ -1818,31 +1431,35 @@ Do NOT provide trading recommendations, entry/exit prices, or any rationale for 
             else:
                 df_hist = pd.DataFrame()
             if df_hist.empty:
-                self.llm_output.setHtml("<b>[ML Training]</b> No historical data available for this symbol/timeframe.")
+                log_html += "<b>[ML Training]</b> No historical data available for this symbol/timeframe.<br>"
+                self.show_analysis_window(log_html)
                 after_analysis()
                 return
             valid_rows = len(df_hist.dropna(subset=["open", "high", "low", "close", "volume"]))
             if valid_rows < indicator_lookback:
-                self.llm_output.setHtml(
-                    f"<b>[ML Training]</b> Not enough valid data for indicator calculation. At least {indicator_lookback} rows are required after cleaning. Valid rows: {valid_rows}"
+                log_html += (
+                    f"<b>[ML Training]</b> Not enough valid data for indicator calculation. At least {indicator_lookback} rows are required after cleaning. Valid rows: {valid_rows}<br>"
                 )
+                self.show_analysis_window(log_html)
                 after_analysis()
                 return
             usable_rows = min(rows, valid_rows - indicator_lookback)
             if usable_rows < 1:
-                self.llm_output.setHtml(
-                    f"<b>[ML Training]</b> Not enough data after indicator lookback. Try lowering the rows setting or using a higher timeframe."
+                log_html += (
+                    f"<b>[ML Training]</b> Not enough data after indicator lookback. Try lowering the rows setting or using a higher timeframe.<br>"
                 )
+                self.show_analysis_window(log_html)
                 after_analysis()
                 return
             if usable_rows < rows:
-                self.llm_output.append(
-                    f"<b>[ML Training]</b> Only {usable_rows} rows available for training after indicator calculation. Proceeding with available data."
+                log_html += (
+                    f"<b>[ML Training]</b> Only {usable_rows} rows available for training after indicator calculation. Proceeding with available data.<br>"
                 )
             try:
                 df_hist = self.add_technical_indicators(df_hist, min_rows=usable_rows)
             except ValueError as e:
-                self.llm_output.setHtml(f"<b>[ML Training]</b> {e}")
+                log_html += f"<b>[ML Training]</b> {e}<br>"
+                self.show_analysis_window(log_html)
                 after_analysis()
                 return
             self.ml_analyzer.set_custom_model_class(None)
@@ -1889,11 +1506,11 @@ Do NOT provide trading recommendations, entry/exit prices, or any rationale for 
                         try:
                             if hasattr(self.ml_analyzer, 'pipeline_'):
                                 joblib.dump(self.ml_analyzer.pipeline_, model_path_optuna)
-                                self.llm_output.append(f"<b>[ML Training]</b> Hyperparameter-tuned model saved to {model_path_optuna}")
+                                log_html_local = log_html + f"<b>[ML Training]</b> Hyperparameter-tuned model saved to {model_path_optuna}<br>"
                             else:
-                                self.llm_output.append("<b>[ML Training]</b> Warning: No pipeline_ attribute found after Optuna tuning.")
+                                log_html_local = log_html + "<b>[ML Training]</b> Warning: No pipeline_ attribute found after Optuna tuning.<br>"
                         except Exception as e:
-                            self.llm_output.append(f"<b>[ML Training]</b> Error saving Optuna-tuned model: {e}")
+                            log_html_local = log_html + f"<b>[ML Training]</b> Error saving Optuna-tuned model: {e}<br>"
                         html = f"""
                         <div style='font-family:Arial,sans-serif;'>
                         <h2 style='margin-bottom:0;'>Optuna Hyperparameter Tuning Results</h2>
@@ -1907,11 +1524,11 @@ Do NOT provide trading recommendations, entry/exit prices, or any rationale for 
                         <hr style='margin:8px 0;'>
                         </div>
                         """
-                        self.llm_output.setHtml(html)
+                        self.show_analysis_window(log_html_local + html)
                         after_training()
                     def on_error(msg):
                         progress.close()
-                        self.llm_output.setHtml(f"<b>[ML Training]</b> Error during tuning: {msg}")
+                        self.show_analysis_window(log_html + f"<b>[ML Training]</b> Error during tuning: {msg}<br>")
                         after_analysis()
                     self.optuna_worker.result_ready.connect(on_result)
                     self.optuna_worker.error_occurred.connect(on_error)
@@ -1923,65 +1540,884 @@ Do NOT provide trading recommendations, entry/exit prices, or any rationale for 
             try:
                 if hasattr(self.ml_analyzer, 'pipeline_'):
                     joblib.dump(self.ml_analyzer.pipeline_, model_path)
-                    self.llm_output.append(f"<b>[ML Training]</b> Regular model saved to {model_path}")
+                    log_html += f"<b>[ML Training]</b> Regular model saved to {model_path}<br>"
                 else:
-                    self.llm_output.append("<b>[ML Training]</b> Warning: No pipeline_ attribute found after training.")
+                    log_html += "<b>[ML Training]</b> Warning: No pipeline_ attribute found after training.<br>"
             except Exception as e:
-                self.llm_output.append(f"<b>[ML Training]</b> Error saving regular model: {e}")
-            self.llm_output.setHtml(self.format_ml_training_result_html(results))
+                log_html += f"<b>[ML Training]</b> Error saving regular model: {e}<br>"
+            log_html += self.format_ml_training_result_html(results)
+            self.show_analysis_window(log_html)
             after_training()
         patched_train_model()
 
-def call_ollama_llm(prompt: str, model: str = "llama2", temperature: float = 0.2, max_tokens: int = 512) -> str:
-    """
-    Call the local Ollama LLM API with a prompt and return the response.
-    """
-    url = "http://localhost:11434/api/generate"
-    payload = {
-        "model": model,
-        "prompt": prompt,
-        "temperature": temperature,
-        "max_tokens": max_tokens,
-        "stream": False
-    }
-    try:
-        response = requests.post(url, json=payload, timeout=60)
-        response.raise_for_status()
-        data = response.json()
-        return data.get("response", "[No response from Ollama]")
-    except Exception as e:
-        return f"[Ollama API error: {e}]"
+    def show_analysis_window(self, html_content: str, closable: bool = True):
+        from PyQt6.QtWidgets import QDialog, QVBoxLayout, QTextEdit, QPushButton
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Analysis & Recommendations Report")
+        dialog.setGeometry(350, 350, 900, 600)
+        layout = QVBoxLayout()
+        text_edit = QTextEdit()
+        text_edit.setReadOnly(True)
+        text_edit.setHtml(html_content)
+        layout.addWidget(text_edit)
+        close_btn = QPushButton("Close")
+        close_btn.clicked.connect(dialog.accept)
+        close_btn.setEnabled(closable)
+        layout.addWidget(close_btn)
+        dialog.setLayout(layout)
+        dialog.show()
+        dialog.raise_()
+        dialog.activateWindow()
+        self._analysis_dialog = dialog
+        self._analysis_text_edit = text_edit
+        self._analysis_close_btn = close_btn
 
-# --- Ollama health check ---
-def ollama_is_running() -> bool:
-    """Check if Ollama is running locally by pinging the /api/tags endpoint."""
-    try:
-        resp = requests.get("http://localhost:11434/api/tags", timeout=2)
-        return resp.status_code == 200
-    except Exception:
-        return False
+    def update_analysis_window(self, html_content: str, closable: bool = False):
+        if hasattr(self, '_analysis_text_edit'):
+            self._analysis_text_edit.setHtml(html_content)
+        if hasattr(self, '_analysis_close_btn'):
+            self._analysis_close_btn.setEnabled(closable)
 
-class TickerFetcher(QThread):
-    data_fetched = pyqtSignal(dict)
-    def __init__(self, get_symbol_func):
-        super().__init__()
-        self.get_symbol_func = get_symbol_func
-        self._running = True
-    def run(self):
-        import time
-        while self._running:
-            symbol = self.get_symbol_func()
+    def train_model(self):
+        from PyQt6.QtWidgets import QMessageBox, QProgressDialog
+        from PyQt6.QtCore import QThread, pyqtSignal
+        import os
+        import joblib
+        rows = 1000  # Default value, or compute based on timeframe/algorithm if needed
+        custom = self.select_pair_button.text().strip().upper()
+        if custom:
+            symbol = f"{custom}/USDT"
+        else:
+            self.show_analysis_window("<b>[ML Training]</b> Please enter a symbol (e.g., BTC) in the Pair field.")
+            return
+        timeframe = self.timeframe_combo.currentText()
+        exchange = getattr(self, 'selected_exchange', 'OKX')
+        # Normalize timeframe for CCXT
+        if str(exchange).lower().startswith("ccxt:"):
+            ccxt_name = str(exchange).split(":", 1)[1]
+            norm_timeframe = self.get_ccxt_timeframe(ccxt_name, timeframe)
+        else:
+            norm_timeframe = self.timeframe_map.get(timeframe, timeframe)
+        indicator_lookback = max([100, 26, 20, 14])
+        min_required_rows = rows + indicator_lookback
+        from src.utils.helpers import fetch_ohlcv
+        ohlcv = fetch_ohlcv(exchange, symbol, norm_timeframe, limit=min_required_rows)
+        from src.utils.data_storage import save_ohlcv, load_ohlcv
+        df_hist = None
+        if ohlcv:
+            save_ohlcv(symbol, norm_timeframe, ohlcv)
+            df_hist = load_ohlcv(symbol, norm_timeframe)
+        else:
+            df_hist = pd.DataFrame()
+        if df_hist.empty:
+            self.show_analysis_window("<b>[ML Training]</b> No historical data available for this symbol/timeframe.")
+            return
+        valid_rows = len(df_hist.dropna(subset=["open", "high", "low", "close", "volume"]))
+        if valid_rows < indicator_lookback:
+            self.show_analysis_window(
+                f"<b>[ML Training]</b> Not enough valid data for indicator calculation. At least {indicator_lookback} rows are required after cleaning. Valid rows: {valid_rows}"
+            )
+            return
+        usable_rows = min(rows, valid_rows - indicator_lookback)
+        if usable_rows < 1:
+            self.show_analysis_window(
+                f"<b>[ML Training]</b> Not enough data after indicator lookback. Try lowering the rows setting or using a higher timeframe."
+            )
+            return
+        if usable_rows < rows:
+            self.show_analysis_window(
+                f"<b>[ML Training]</b> Only {usable_rows} rows available for training after indicator calculation. Proceeding with available data."
+            )
+        try:
+            df_hist = self.add_technical_indicators(df_hist, min_rows=usable_rows)
+        except ValueError as e:
+            self.show_analysis_window(f"<b>[ML Training]</b> {e}")
+            return
+        self.ml_analyzer.set_custom_model_class(None)
+        # --- Prompt for hyperparameter tuning if supported ---
+        model_base = f"model_{symbol.replace('/', '-')}_{norm_timeframe}_{self.selected_algorithm}"
+        model_path = os.path.join("Models", model_base + ".pkl")
+        model_path_optuna = os.path.join("ModelsOptuna", model_base + ".pkl")
+        os.makedirs(os.path.dirname(model_path), exist_ok=True)
+        os.makedirs(os.path.dirname(model_path_optuna), exist_ok=True)
+        if "Ensemble" not in self.selected_algorithm:
+            reply = QMessageBox.question(self, "Hyperparameter Tuning", "Do you want to run Optuna hyperparameter tuning?", QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
+            if reply == QMessageBox.StandardButton.Yes:
+                class OptunaWorker(QThread):
+                    result_ready = pyqtSignal(object)
+                    error_occurred = pyqtSignal(str)
+                    def __init__(self, analyzer, df, model_type):
+                        super().__init__()
+                        self.analyzer = analyzer
+                        self.df = df
+                        self.model_type = model_type
+                        self._cancel = False
+                    def run(self):
+                        try:
+                            study = self.analyzer.optimize_with_optuna(self.df, model_type=self.model_type, n_trials=20)
+                            if self._cancel:
+                                return
+                            self.result_ready.emit(study)
+                        except Exception as e:
+                            self.error_occurred.emit(str(e))
+                    def cancel(self):
+                        self._cancel = True
+                progress = QProgressDialog("Running Optuna hyperparameter tuning...", "Cancel", 0, 0, self)
+                progress.setWindowTitle("Hyperparameter Tuning")
+                progress.setWindowModality(Qt.WindowModality.ApplicationModal)
+                progress.setMinimumDuration(0)
+                progress.setValue(0)
+                progress.setCancelButtonText("Cancel")
+                progress.show()
+                self.optuna_worker = OptunaWorker(self.ml_analyzer, df_hist, self.selected_algorithm)
+                def on_result(study):
+                    progress.close()
+                    best_trial = study.best_trial
+                    best_params = best_trial.params
+                    best_score = best_trial.value
+                    # Save the Optuna-tuned model
+                    try:
+                        if hasattr(self.ml_analyzer, 'pipeline_'):
+                            joblib.dump(self.ml_analyzer.pipeline_, model_path_optuna)
+                            self.show_analysis_window(f"<b>[ML Training]</b> Hyperparameter-tuned model saved to {model_path_optuna}")
+                        else:
+                            self.show_analysis_window("<b>[ML Training]</b> Warning: No pipeline_ attribute found after Optuna tuning.")
+                    except Exception as e:
+                        self.show_analysis_window(f"<b>[ML Training]</b> Error saving Optuna-tuned model: {e}")
+                    html = f"""
+                    <div style='font-family:Arial,sans-serif;'>
+                    <h2 style='margin-bottom:0;'>Optuna Hyperparameter Tuning Results</h2>
+                    <b>Algorithm:</b> {self.selected_algorithm}<br>
+                    <b>Best Score (Accuracy):</b> <span style='color:green;font-weight:bold;'>{best_score:.4f}</span><br>
+                    <b>Best Hyperparameters:</b><br>
+                    <ul>
+                    {''.join(f'<li><b>{k}:</b> {v}</li>' for k, v in best_params.items())}
+                    </ul>
+                    <b>Timestamp:</b> {datetime.now().isoformat()}<br>
+                    <hr style='margin:8px 0;'>
+                    </div>
+                    """
+                    self.show_analysis_window(html)
+                def on_error(msg):
+                    progress.close()
+                    self.show_analysis_window(f"<b>[ML Training]</b> Error during tuning: {msg}")
+                self.optuna_worker.result_ready.connect(on_result)
+                self.optuna_worker.error_occurred.connect(on_error)
+                progress.canceled.connect(self.optuna_worker.cancel)
+                self.optuna_worker.start()
+                return
+        # --- Standard training ---
+        results = self.ml_analyzer.train_model(df_hist)
+        # Save the regular model
+        try:
+            if hasattr(self.ml_analyzer, 'pipeline_'):
+                joblib.dump(self.ml_analyzer.pipeline_, model_path)
+                self.show_analysis_window(f"<b>[ML Training]</b> Regular model saved to {model_path}")
+            else:
+                self.show_analysis_window("<b>[ML Training]</b> Warning: No pipeline_ attribute found after training.")
+        except Exception as e:
+            self.show_analysis_window(f"<b>[ML Training]</b> Error saving regular model: {e}")
+        self.show_analysis_window(self.format_ml_training_result_html(results))
+        if self.selected_algorithm == "LSTM":
             try:
-                ticker = fetch_okx_ticker(symbol)
-                if ticker:
-                    self.data_fetched.emit(ticker)
-                else:
-                    self.data_fetched.emit({})
-            except Exception:
-                self.data_fetched.emit({})
-            time.sleep(1)
+                from src.analysis.lstm_regressor import LSTMRegressor
+                import numpy as np
+                window = 30
+                feature_cols = [c for c in df_hist.columns if c not in ['timestamp', 'close']]
+                features = df_hist[feature_cols].values.astype(np.float32)
+                targets = df_hist['close'].values.astype(np.float32)
+                X, y = LSTMRegressor.create_windowed_dataset(features, targets, window)
+                input_size = X.shape[2] if X.ndim == 3 else len(feature_cols)
+                model_base = f"model_{symbol.replace('/', '-')}_{norm_timeframe}_{self.selected_algorithm}"
+                model_path = os.path.join("Models", model_base + ".pt")
+                log_html = "<b>[ML Training]</b> Preparing to train LSTM..."
+                self.show_analysis_window(log_html, closable=False)
+                self.lstm_worker = LSTMTrainingWorker(X, y, input_size, model_path)
+                self.lstm_worker.progress.connect(lambda html: self.update_analysis_window(html, closable=False))
+                def on_finished(model):
+                    self.ml_analyzer.model = model
+                    self.update_analysis_window(f"<b>[ML Training]</b> LSTM model saved to {model_path}<br>", closable=True)
+                self.lstm_worker.finished.connect(on_finished)
+                self.lstm_worker.start()
+            except Exception as e:
+                self.show_analysis_window(f"<b>[ML Training]</b> Error during LSTM training: {e}")
+            return
+        # Only for non-LSTM models:
+        if hasattr(self.ml_analyzer, 'pipeline_'):
+            joblib.dump(self.ml_analyzer.pipeline_, model_path)
+            self.show_analysis_window(f"<b>[ML Training]</b> Regular model saved to {model_path}")
+        # Do not show any window if pipeline_ is missing
+
     def stop(self):
         self._running = False
+
+    def select_pair_from_menu(self, item):
+        label = item.text()
+        # Parse pair and exchange(s)
+        if "[" in label:
+            pair, src = label.split("[")
+            pair = pair.strip()
+            srcs = src.strip("] ").split(",")
+            # Prefer OKX if available, else CCXT
+            if "OKX" in srcs:
+                self.selected_exchange = "OKX"
+            elif any(s.startswith("CCXT:") for s in srcs):
+                ccxt_src = next(s for s in srcs if s.startswith("CCXT:"))
+                self.selected_exchange = ccxt_src.lower()
+            else:
+                self.selected_exchange = "OKX"
+            self.selected_pair = pair  # Store the actual symbol as shown in CCXT or other exchanges
+        else:
+            pair = label.strip()
+            # If the label is from a CCXT dynamic load, set selected_exchange accordingly
+            if "[CCXT:" in label:
+                ccxt_src = label.split("[CCXT:")[-1].strip("] ")
+                self.selected_exchange = f"ccxt:{ccxt_src.lower()}"
+                self.selected_pair = pair  # Store the actual symbol
+            else:
+                self.selected_exchange = "OKX"
+                self.selected_pair = pair
+        self.select_pair_button.setText(pair)
+        # Remove the menu and restore the data table
+        self.centralWidget().layout().removeWidget(self.pair_menu_widget)
+        self.pair_menu_widget.deleteLater()
+        self.pair_menu_widget = None  # Ensure reference is cleared
+        self.data_table.setVisible(True)
+        # Automatically fetch data for the selected pair
+        self.fetch_data()
+
+    def add_technical_indicators(self, df: pd.DataFrame, min_rows: int = 35) -> pd.DataFrame:
+        """
+        Add technical indicators to a DataFrame using the shared utility.
+        Args:
+            df (pd.DataFrame): Input OHLCV DataFrame.
+            min_rows (int): Minimum number of rows required.
+        Returns:
+            pd.DataFrame: DataFrame with indicators.
+        Raises:
+            ValueError: If not enough data.
+        """
+        if len(df) < min_rows:
+            raise ValueError(f"Not enough data for indicator calculation. At least {min_rows} rows required, got {len(df)}.")
+        from src.utils.helpers import calculate_technical_indicators
+        return calculate_technical_indicators(df)
+
+    def filter_pair_list(self, text: str = ""):
+        """
+        Filter the pair list based on the search input and selected exchange.
+        """
+        search_text = text.lower()
+        selected_exchange = self.exchange_combo.currentText()
+        self.pair_list.clear()
+        for label in self.all_pairs:
+            pair = label.split(" [")[0].lower()
+            sources = label.lower()
+            if search_text in pair:
+                if selected_exchange == "All" or selected_exchange.lower() in sources:
+                    self.pair_list.addItem(label)
+
+    def format_ml_training_result_html(self, results: dict) -> str:
+        """
+        Format ML training results as HTML for display in the GUI.
+
+        Args:
+            results (dict): The dictionary of training results.
+
+        Returns:
+            str: HTML-formatted string for display.
+        """
+        if not results:
+            return "<b>[ML Training]</b> No results to display."
+        html = "<h3>ML Training Results</h3><ul>"
+        for key, value in results.items():
+            if isinstance(value, float):
+                html += f"<li><b>{key}:</b> {value:,.4f}</li>"
+            elif isinstance(value, int):
+                html += f"<li><b>{key}:</b> {value:,}</li>"
+            elif isinstance(value, dict):
+                html += f"<li><b>{key}:</b><ul>"
+                for k2, v2 in value.items():
+                    html += f"<li>{k2}: {v2}</li>"
+                html += "</ul></li>"
+            elif isinstance(value, list) and value and all(isinstance(x, (float, int)) for x in value):
+                formatted = ', '.join(f"{x:.4f}" for x in value)
+                html += f"<li><b>{key}:</b> <span style='font-family:monospace'>{formatted}</span></li>"
+            else:
+                html += f"<li><b>{key}:</b> {value}</li>"
+        html += "</ul>"
+        return html
+
+    def format_ml_analysis_html(self, result: dict) -> str:
+        """
+        Format the ML analysis result as a visually clear, color-coded HTML summary for display.
+        Args:
+            result (dict): The dictionary of ML analysis results.
+        Returns:
+            str: HTML-formatted string for display.
+        """
+        if not isinstance(result, dict):
+            return "<b>[ML Analysis]</b> Invalid result."
+        if 'error' in result:
+            return f"<b>[ML Analysis Error]</b> {result['error']}"
+        # Color helpers
+        def color_for_recommendation(rec):
+            return 'green' if rec == 'BUY' else 'red' if rec == 'SELL' else 'gray'
+        def color_for_direction(dir):
+            return 'green' if dir and dir.upper() in ['UP', 'BULLISH'] else 'red' if dir and dir.upper() in ['DOWN', 'BEARISH'] else 'gray'
+        def color_for_confidence(val):
+            try:
+                v = float(val)
+                if v >= 80:
+                    return 'green'
+                elif v >= 60:
+                    return 'orange'
+                else:
+                    return 'red'
+            except Exception:
+                return 'gray'
+        # Start HTML
+        html = """
+        <div style='font-family:Arial,sans-serif;max-width:700px;'>
+        <h2 style='color:#007acc;margin-bottom:0;'>ML Analysis Results</h2>
+        <table style='width:100%;margin-bottom:10px;'>
+        <tr><td><b>Symbol:</b></td><td>{symbol}</td></tr>
+        <tr><td><b>Timeframe:</b></td><td>{timeframe}</td></tr>
+        <tr><td><b>Recommendation:</b></td><td style='color:{rec_color};font-weight:bold;'>{recommendation}</td></tr>
+        <tr><td><b>Direction:</b></td><td style='color:{dir_color};font-weight:bold;'>{direction}</td></tr>
+        <tr><td><b>Confidence:</b></td><td style='color:{conf_color};font-weight:bold;'>{confidence:.4f}</td></tr>
+        <tr><td><b>Current Price:</b></td><td>{current_price:,.4f}</td></tr>
+        <tr><td><b>Stop Loss:</b></td><td>{stop_loss:,.4f}</td></tr>
+        <tr><td><b>Take Profit:</b></td><td>{take_profit:,.4f}</td></tr>
+        </table>
+        <b>Support Levels:</b> <span style='color:#007acc'>{support_levels}</span><br>
+        <b>Resistance Levels:</b> <span style='color:#d2691e'>{resistance_levels}</span><br>
+        <b>Top Features:</b> <span style='color:#6a5acd'>{top_features}</span><br>
+        <b>Key Indicators:</b> <span style='color:#333'>{key_indicators}</span><br>
+        <hr style='margin:10px 0;'>
+        <b>Limit Orders:</b><br>{limit_orders_html}
+        <hr style='margin:10px 0;'>
+        <b>Entry Points:</b> <span style='color:#007acc'>{entry_points}</span><br>
+        <b>Exit Points:</b> <span style='color:#228b22'>{exit_points}</span><br>
+        <b>Stop Loss Points:</b> <span style='color:#b22222'>{stop_loss_points}</span><br>
+        </div>
+        """
+        # Extract fields with safe fallback
+        def safe_float(val, default=0.0):
+            try:
+                return float(val)
+            except Exception:
+                return default
+        def safe_str(val, default="--"):
+            return str(val) if val is not None else default
+        symbol = safe_str(result.get('symbol', '--'))
+        timeframe = safe_str(result.get('timeframe', '--'))
+        recommendation = safe_str(result.get('recommendation', '--'))
+        direction = safe_str(result.get('direction', '--'))
+        confidence = safe_float(result.get('confidence', 0.0))
+        current_price = safe_float(result.get('current_price', 0.0))
+        stop_loss = safe_float(result.get('stop_loss', 0.0))
+        take_profit = safe_float(result.get('take_profit', 0.0))
+        support_levels = ', '.join(f"{safe_float(x):,.4f}" for x in (result.get('support_levels') or []))
+        resistance_levels = ', '.join(f"{safe_float(x):,.4f}" for x in (result.get('resistance_levels') or []))
+        top_features = ', '.join([safe_str(x) for x in (result.get('top_features') or [])])
+        key_indicators = result.get('key_indicators')
+        if isinstance(key_indicators, dict):
+            key_indicators = ', '.join(f"{k}: {safe_float(v):.2f}" for k, v in key_indicators.items())
+        else:
+            key_indicators = safe_str(key_indicators)
+        # Limit orders (color-coded table)
+        def format_limit_orders(lo):
+            if not isinstance(lo, dict):
+                return str(lo)
+            html = "<table style='width:100%;border-collapse:collapse;margin-top:5px;'>"
+            html += "<tr style='background:#f0f0f0;'><th>Type</th><th>Price</th><th>Description</th><th>Confidence</th></tr>"
+            for k, v in lo.items():
+                if isinstance(v, list):
+                    for item in v:
+                        if isinstance(item, dict):
+                            conf = item.get('confidence', '--')
+                            conf_color = color_for_confidence(conf)
+                            html += f"<tr>"
+                            html += f"<td style='font-weight:bold;'>{k.title()}</td>"
+                            html += f"<td>{item.get('price', '--')}</td>"
+                            html += f"<td>{item.get('description', '--')}</td>"
+                            html += f"<td style='color:{conf_color};font-weight:bold;'>{conf}</td>"
+                            html += "</tr>"
+                else:
+                    html += f"<tr><td colspan='4'>{v}</td></tr>"
+            html += "</table>"
+            return html
+        limit_orders_html = format_limit_orders(result.get('limit_orders', {}))
+        # Points
+        entry_points = ', '.join(f"{safe_float(x):,.4f}" for x in (result.get('entry_points') or []))
+        exit_points = ', '.join(f"{safe_float(x):,.4f}" for x in (result.get('exit_points') or []))
+        stop_loss_points = ', '.join(f"{safe_float(x):,.4f}" for x in (result.get('stop_loss_points') or []))
+        # Colors
+        rec_color = color_for_recommendation(recommendation)
+        dir_color = color_for_direction(direction)
+        conf_color = color_for_confidence(confidence)
+        # Format
+        return html.format(
+            symbol=symbol,
+            timeframe=timeframe,
+            recommendation=recommendation,
+            rec_color=rec_color,
+            direction=direction,
+            dir_color=dir_color,
+            confidence=confidence,
+            conf_color=conf_color,
+            current_price=current_price,
+            stop_loss=stop_loss,
+            take_profit=take_profit,
+            support_levels=support_levels,
+            resistance_levels=resistance_levels,
+            top_features=top_features,
+            key_indicators=key_indicators,
+            limit_orders_html=limit_orders_html,
+            entry_points=entry_points,
+            exit_points=exit_points,
+            stop_loss_points=stop_loss_points
+        )
+
+    def show_pair_menu(self):
+        # Toggle: If the menu is already open, close it
+        if hasattr(self, 'pair_menu_widget') and self.pair_menu_widget is not None:
+            self.centralWidget().layout().removeWidget(self.pair_menu_widget)
+            self.pair_menu_widget.deleteLater()
+            self.pair_menu_widget = None
+            self.data_table.setVisible(True)
+            return
+
+        from Data.okx_public_data import fetch_okx_ticker
+        # Hide the data table
+        self.data_table.setVisible(False)
+        # Create the pair menu widget
+        self.pair_menu_widget = QWidget()
+        layout = QVBoxLayout()
+        # Add search bar
+        self.pair_search_input = QLineEdit()
+        self.pair_search_input.setPlaceholderText("Search pairs...")
+        layout.addWidget(self.pair_search_input)
+        self.pair_list = QListWidget()
+        layout.addWidget(QLabel("Select a Pair:"))
+        layout.addWidget(self.pair_list)
+        self.ccxt_exchanges = ["binanceus", "okx", "kraken", "bybit", "kucoin"]
+        self.exchange_combo = QComboBox()
+        self.exchange_combo.addItems(["All", "OKX"] + [f"CCXT:{exch}" for exch in self.ccxt_exchanges])
+        layout.addWidget(QLabel("Exchange:"))
+        layout.addWidget(self.exchange_combo)
+        self.pair_menu_widget.setLayout(layout)
+        self.centralWidget().layout().addWidget(self.pair_menu_widget)
+
+        # --- Fetch all pairs for all exchanges (OKX and CCXT) ---
+        okx_pairs = set()
+        try:
+            tickers = fetch_okx_ticker(None, all_markets=True)
+            okx_pairs = set(
+                t['instId'].replace("-", "/")
+                for t in tickers if 'instId' in t and t['instId'].endswith('-USDT')
+            )
+        except Exception as e:
+            okx_pairs = set([f"Error loading OKX pairs: {e}"])
+        # Fetch CCXT pairs for all exchanges
+        ccxt_pairs_by_exchange = {}
+        for exch in self.ccxt_exchanges:
+            try:
+                pairs = self.get_ccxt_pairs(exch)
+                ccxt_pairs_by_exchange[exch] = pairs
+            except Exception as e:
+                ccxt_pairs_by_exchange[exch] = set([f"Error loading CCXT:{exch} pairs: {e}"])
+        # Merge all pairs for 'All'
+        all_pairs_set = set(okx_pairs)
+        for pairs in ccxt_pairs_by_exchange.values():
+            all_pairs_set.update(pairs)
+        # Build pair_sources for all pairs
+        self.pair_sources = {}
+        for p in all_pairs_set:
+            srcs = []
+            if p in okx_pairs:
+                srcs.append("OKX")
+            for exch in self.ccxt_exchanges:
+                if p in ccxt_pairs_by_exchange[exch]:
+                    srcs.append(f"CCXT:{exch}")
+            self.pair_sources[p] = srcs
+        # Display as: BTC/USDT [OKX,CCXT:binanceus,...]
+        self.all_pairs = [f"{p} [{','.join(self.pair_sources[p])}]" for p in sorted(all_pairs_set)]
+        self.pair_list.clear()
+        self.pair_list.addItems(self.all_pairs)
+        self.pair_list.itemClicked.connect(self.select_pair_from_menu)
+        self.pair_search_input.textChanged.connect(self.filter_pair_list)
+        # --- Dynamic filtering by exchange ---
+        def on_exchange_changed():
+            selected_exchange = self.exchange_combo.currentText()
+            self.pair_list.clear()
+            if selected_exchange == "All":
+                self.pair_list.addItems(self.all_pairs)
+            elif selected_exchange == "OKX":
+                okx_labels = [f"{p} [OKX]" for p in sorted(okx_pairs)]
+                self.pair_list.addItems(okx_labels)
+            elif selected_exchange.startswith("CCXT:"):
+                exch = selected_exchange.split(":", 1)[1]
+                ccxt_labels = [f"{p} [CCXT:{exch}]" for p in sorted(ccxt_pairs_by_exchange.get(exch, []))]
+                self.pair_list.addItems(ccxt_labels)
+        self.exchange_combo.currentTextChanged.connect(on_exchange_changed)
+        # Initial filter
+        self.filter_pair_list(self.pair_search_input.text())
+
+    def start_lstm_stream(self):
+        if self.lstm_streamer is not None:
+            self.stop_lstm_stream()
+        if not hasattr(self.ml_analyzer, 'model') or self.ml_analyzer.model is None:
+            self.lstm_forecast_label.setText("LSTM Stream: No model loaded.")
+            return
+        if not hasattr(self.ml_analyzer, 'lstm_window'):
+            self.lstm_forecast_label.setText("LSTM Stream: No LSTM window size.")
+            return
+        def fetch_latest_ohlcv():
+            return getattr(self, 'last_df_hist', None)
+        self.lstm_streamer = LSTMDataStreamer(
+            fetch_func=fetch_latest_ohlcv,
+            lstm_model=self.ml_analyzer.model,
+            window_size=getattr(self.ml_analyzer, 'lstm_window', 30),
+            interval=60  # seconds
+        )
+        self.lstm_streamer.prediction_ready.connect(self.handle_lstm_prediction)
+        self.lstm_streamer.error_occurred.connect(lambda msg: self.lstm_forecast_label.setText(f"LSTM Stream Error: {msg}"))
+        self.lstm_streamer.start()
+        self.lstm_forecast_label.setText("LSTM Stream: Running...")
+
+    def stop_lstm_stream(self):
+        if self.lstm_streamer is not None:
+            self.lstm_streamer.stop()
+            self.lstm_streamer.wait()
+            self.lstm_streamer = None
+            self.lstm_forecast_label.setText("LSTM Stream: Stopped.")
+
+    def toggle_lstm_stream(self, checked):
+        if checked:
+            self.lstm_stream_button.setText("Stop LSTM Stream")
+            self.start_lstm_stream()
+        else:
+            self.lstm_stream_button.setText("Start LSTM Stream")
+            self.stop_lstm_stream()
+
+    def handle_lstm_prediction(self, result: dict):
+        forecast = result.get('forecast')
+        unc = result.get('uncertainty')
+        delta = result.get('delta')
+        pct = result.get('percent_change')
+        last_close = result.get('last_close')
+        ts = result.get('timestamp')
+        self.lstm_forecast_label.setText(
+            f"LSTM Stream: {forecast:.4f} (Δ={delta:+.4f}, {pct:+.2f}%) | Unc={unc:.4f} | Last={last_close:.4f} | t={ts}"
+        )
+        self.append_lstm_stream_output(result)
+
+    def show_lstm_stream_output_window(self):
+        if hasattr(self, '_lstm_stream_output_dialog') and self._lstm_stream_output_dialog is not None:
+            self._lstm_stream_output_dialog.raise_()
+            self._lstm_stream_output_dialog.activateWindow()
+            return
+
+        from PyQt6.QtWidgets import QDialog, QVBoxLayout, QTableWidget, QTableWidgetItem, QPushButton, QHeaderView, QTabWidget, QWidget, QFormLayout, QSpinBox, QLabel, QHBoxLayout, QComboBox
+        from PyQt6.QtCore import QTimer, Qt
+        import psutil
+        import os
+        import pyqtgraph as pg
+        dialog = QDialog(self)
+        dialog.setWindowTitle("LSTM Stream Output")
+        dialog.setGeometry(400, 400, 900, 600)
+        main_layout = QVBoxLayout()
+
+        tab_widget = QTabWidget()
+
+        # --- Stream Output Tab ---
+        output_tab = QWidget()
+        output_layout = QVBoxLayout()
+        # Dark mode toggle
+        self._lstm_darkmode_checkbox = QPushButton("Enable Dark Mode")
+        self._lstm_darkmode_checkbox.setCheckable(True)
+        self._lstm_darkmode_checkbox.setChecked(False)
+        output_layout.addWidget(self._lstm_darkmode_checkbox)
+        table = QTableWidget(0, 7)
+        table.setHorizontalHeaderLabels([
+            "Timestamp", "Forecast", "Δ", "% Change", "Uncertainty", "Last Close", "Trend"
+        ])
+        table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
+        output_layout.addWidget(table)
+        # --- Sparkline Chart ---
+        import pyqtgraph as pg
+        self._lstm_sparkline_plot = pg.PlotWidget()
+        def set_chart_theme(dark):
+            if dark:
+                self._lstm_sparkline_plot.setBackground('k')
+                self._lstm_sparkline_plot.getAxis('left').setTextPen('w')
+                self._lstm_sparkline_plot.getAxis('bottom').setTextPen('w')
+                forecast_pen = pg.mkPen('c', width=2)
+                actual_pen = pg.mkPen('y', width=2)
+                unc_pen = pg.mkPen('m', width=1, style=Qt.PenStyle.DashLine)
+            else:
+                self._lstm_sparkline_plot.setBackground('w')
+                self._lstm_sparkline_plot.getAxis('left').setTextPen('k')
+                self._lstm_sparkline_plot.getAxis('bottom').setTextPen('k')
+                forecast_pen = pg.mkPen('b', width=2)
+                actual_pen = pg.mkPen('g', width=2)
+                unc_pen = pg.mkPen('y', width=1, style=Qt.PenStyle.DashLine)
+            self._lstm_sparkline_forecast.setPen(forecast_pen)
+            self._lstm_sparkline_actual.setPen(actual_pen)
+            self._lstm_sparkline_unc.setPen(unc_pen)
+        self._lstm_sparkline_plot.showGrid(x=True, y=True)
+        self._lstm_sparkline_plot.setYRange(0, 1)
+        self._lstm_sparkline_plot.setMinimumHeight(120)
+        self._lstm_sparkline_plot.addLegend()
+        self._lstm_sparkline_forecast = self._lstm_sparkline_plot.plot([], [], pen=pg.mkPen('b', width=2), name="Forecast")
+        self._lstm_sparkline_actual = self._lstm_sparkline_plot.plot([], [], pen=pg.mkPen('g', width=2), name="Last Close")
+        self._lstm_sparkline_unc = self._lstm_sparkline_plot.plot([], [], pen=pg.mkPen('y', width=1, style=Qt.PenStyle.DashLine), name="Uncertainty")
+        self._lstm_sparkline_data = []  # List of (timestamp, forecast, last_close, uncertainty)
+        output_layout.addWidget(self._lstm_sparkline_plot)
+        # Dark mode toggle logic
+        def on_darkmode_toggled():
+            set_chart_theme(self._lstm_darkmode_checkbox.isChecked())
+            self._lstm_darkmode_checkbox.setText("Disable Dark Mode" if self._lstm_darkmode_checkbox.isChecked() else "Enable Dark Mode")
+        self._lstm_darkmode_checkbox.toggled.connect(on_darkmode_toggled)
+        set_chart_theme(False)
+        # Resource usage label
+        self._lstm_resource_label = QLabel("CPU: -- | RAM: -- | GPU: --")
+        output_layout.addWidget(self._lstm_resource_label)
+        output_tab.setLayout(output_layout)
+        tab_widget.addTab(output_tab, "Stream Output")
+
+        # --- Settings Tab (unchanged) ---
+        settings_tab = QWidget()
+        settings_layout = QFormLayout()
+        interval_spin = QSpinBox()
+        interval_spin.setRange(1, 3600)
+        interval_spin.setValue(self.lstm_streamer.interval if self.lstm_streamer else 60)
+        settings_layout.addRow(QLabel("Streaming Interval (seconds):"), interval_spin)
+        window_spin = QSpinBox()
+        window_spin.setRange(5, 200)
+        window_spin.setValue(getattr(self.lstm_streamer, 'window_size', 30) if self.lstm_streamer else 30)
+        settings_layout.addRow(QLabel("LSTM Window Size:"), window_spin)
+        uncertainty_spin = QSpinBox()
+        uncertainty_spin.setRange(1, 100)
+        uncertainty_spin.setValue(getattr(self.lstm_streamer, 'uncertainty_iter', 20) if hasattr(self.lstm_streamer, 'uncertainty_iter') else 20)
+        settings_layout.addRow(QLabel("Uncertainty Iterations:"), uncertainty_spin)
+        feature_cols = []
+        if hasattr(self, 'last_df_hist') and self.last_df_hist is not None:
+            feature_cols = [c for c in self.last_df_hist.columns if c not in ['timestamp', 'close']]
+        features_label = QLabel(", ".join(feature_cols) if feature_cols else "No features detected.")
+        features_label.setWordWrap(True)
+        features_label.setStyleSheet("background:#f0f0f0;padding:6px;border-radius:4px;")
+        settings_layout.addRow(QLabel("Active Features/Indicators (all enabled):"), features_label)
+        model_combo = None
+        model_files = []
+        if os.path.exists("Models"):
+            model_files = [f for f in os.listdir("Models") if f.endswith(".pt")]
+        if len(model_files) > 1:
+            model_combo = QComboBox()
+            model_combo.addItems(model_files)
+            settings_layout.addRow(QLabel("LSTM Model File:"), model_combo)
+        apply_btn = QPushButton("Apply")
+        def apply_settings():
+            new_interval = interval_spin.value()
+            new_window = window_spin.value()
+            new_uncertainty = uncertainty_spin.value()
+            selected_model = None
+            if model_combo is not None:
+                selected_model = model_combo.currentText()
+            self.update_lstm_stream_parameters(
+                interval=new_interval,
+                window_size=new_window,
+                uncertainty_iter=new_uncertainty,
+                features=feature_cols,
+                model_file=selected_model
+            )
+        apply_btn.clicked.connect(apply_settings)
+        settings_layout.addRow(apply_btn)
+        settings_tab.setLayout(settings_layout)
+        tab_widget.addTab(settings_tab, "Settings")
+
+        main_layout.addWidget(tab_widget)
+        close_btn = QPushButton("Close")
+        close_btn.clicked.connect(dialog.accept)
+        main_layout.addWidget(close_btn)
+        dialog.setLayout(main_layout)
+        dialog.show()
+        dialog.raise_()
+        dialog.activateWindow()
+
+        def on_close():
+            self._lstm_stream_output_dialog = None
+            self._lstm_stream_output_table = None
+            self._lstm_sparkline_plot = None
+            self._lstm_sparkline_data = []
+            if hasattr(self, '_lstm_resource_timer') and self._lstm_resource_timer is not None:
+                self._lstm_resource_timer.stop()
+                self._lstm_resource_timer = None
+        dialog.finished.connect(on_close)
+
+        self._lstm_stream_output_dialog = dialog
+        self._lstm_stream_output_table = table
+        # Sparkline data buffer
+        self._lstm_sparkline_data = []
+        self._lstm_sparkline_plot = self._lstm_sparkline_plot
+        self._lstm_sparkline_forecast = self._lstm_sparkline_forecast
+        self._lstm_sparkline_actual = self._lstm_sparkline_actual
+        self._lstm_sparkline_unc = self._lstm_sparkline_unc
+
+        # --- Resource Usage Timer ---
+        def update_resource_usage():
+            cpu = psutil.cpu_percent()
+            ram = psutil.virtual_memory().percent
+            gpu_str = "--"
+            try:
+                import torch
+                if torch.cuda.is_available():
+                    gpu_mem = torch.cuda.memory_allocated() / (1024 ** 3)
+                    gpu_total = torch.cuda.get_device_properties(0).total_memory / (1024 ** 3)
+                    gpu_str = f"{gpu_mem:.2f}GB/{gpu_total:.2f}GB"
+                else:
+                    gpu_str = "N/A"
+            except Exception:
+                try:
+                    import subprocess
+                    result = subprocess.run(["nvidia-smi", "--query-gpu=memory.used,memory.total", "--format=csv,noheader,nounits"], capture_output=True, text=True)
+                    if result.returncode == 0:
+                        used, total = result.stdout.strip().split(',')
+                        gpu_str = f"{float(used)/1024:.2f}GB/{float(total)/1024:.2f}GB"
+                except Exception:
+                    gpu_str = "--"
+            self._lstm_resource_label.setText(f"CPU: {cpu:.1f}% | RAM: {ram:.1f}% | GPU: {gpu_str}")
+        self._lstm_resource_timer = QTimer()
+        self._lstm_resource_timer.timeout.connect(update_resource_usage)
+        self._lstm_resource_timer.start(2000)
+
+    def update_lstm_stream_parameters(self, interval=None, window_size=None, uncertainty_iter=None, features=None, model_file=None):
+        from PyQt6.QtWidgets import QMessageBox
+        if hasattr(self, 'lstm_streamer') and self.lstm_streamer is not None:
+            self.lstm_streamer.stop()
+            self.lstm_streamer.wait()
+            def fetch_latest_ohlcv():
+                df = getattr(self, 'last_df_hist', None)
+                if df is not None and features is not None:
+                    cols = ['timestamp'] + features + ['close']
+                    df = df[[c for c in cols if c in df.columns]]
+                return df
+            lstm_model = self.ml_analyzer.model
+            if model_file is not None:
+                from src.analysis.lstm_regressor import LSTMRegressor
+                import os
+                model_path = os.path.join("Models", model_file)
+                input_size = len(features) if features is not None else 0
+                # --- PATCH: Check input size before loading ---
+                try:
+                    # Try to load state_dict to get expected input size
+                    state_dict = None
+                    import torch
+                    state_dict = torch.load(model_path, map_location=torch.device('cpu'))
+                    # Infer input_size from state_dict shape
+                    weight_ih = state_dict.get('lstm.weight_ih_l0', None)
+                    if weight_ih is not None:
+                        expected_input_size = weight_ih.shape[1]
+                        if input_size != expected_input_size:
+                            QMessageBox.critical(self, "Model Load Error", f"Selected model expects {expected_input_size} features, but you selected {input_size}. Please select the correct features or retrain the model.")
+                            return
+                    lstm_model = LSTMRegressor.load(model_path, input_size=input_size)
+                except Exception as e:
+                    QMessageBox.critical(self, "Model Load Error", f"Failed to load LSTM model:\n{e}")
+                    return  # Do not start streamer if model load fails
+            self.lstm_streamer = LSTMDataStreamer(
+                fetch_func=fetch_latest_ohlcv,
+                lstm_model=lstm_model,
+                window_size=window_size or getattr(self.lstm_streamer, 'window_size', 30),
+                interval=interval or getattr(self.lstm_streamer, 'interval', 60)
+            )
+            if uncertainty_iter is not None:
+                self.lstm_streamer.uncertainty_iter = uncertainty_iter
+            self.lstm_streamer.prediction_ready.connect(self.handle_lstm_prediction)
+            self.lstm_streamer.error_occurred.connect(lambda msg: self.lstm_forecast_label.setText(f"LSTM Stream Error: {msg}"))
+            self.lstm_streamer.start()
+
+    def append_lstm_stream_output(self, result: dict):
+        if not hasattr(self, '_lstm_stream_output_table') or self._lstm_stream_output_table is None:
+            return
+        table = self._lstm_stream_output_table
+        row = table.rowCount()
+        table.insertRow(row)
+        # --- Color coding and trend arrow ---
+        ts = str(result.get('timestamp', ''))
+        forecast = result.get('forecast', 0)
+        delta = result.get('delta', 0)
+        pct = result.get('percent_change', 0)
+        unc = result.get('uncertainty', 0)
+        # --- PATCH: Track previous close ---
+        if not hasattr(self, '_lstm_prev_close'):
+            self._lstm_prev_close = None
+        prev_close = self._lstm_prev_close
+        # Update for next call
+        self._lstm_prev_close = result.get('last_close', 0)
+        # Trend arrow
+        if delta > 0.0001:
+            trend = '↑'
+            trend_color = Qt.GlobalColor.green
+        elif delta < -0.0001:
+            trend = '↓'
+            trend_color = Qt.GlobalColor.red
+        else:
+            trend = '→'
+            trend_color = Qt.GlobalColor.gray
+        # Timestamp
+        ts_item = QTableWidgetItem(ts)
+        table.setItem(row, 0, ts_item)
+        # Forecast
+        forecast_item = QTableWidgetItem(f"{forecast:.4f}")
+        table.setItem(row, 1, forecast_item)
+        # Delta
+        delta_item = QTableWidgetItem(f"{delta:+.4f}")
+        delta_item.setForeground(Qt.GlobalColor.green if delta > 0 else Qt.GlobalColor.red if delta < 0 else Qt.GlobalColor.gray)
+        table.setItem(row, 2, delta_item)
+        # Percent change
+        pct_item = QTableWidgetItem(f"{pct:+.2f}%")
+        pct_item.setForeground(Qt.GlobalColor.green if pct > 0 else Qt.GlobalColor.red if pct < 0 else Qt.GlobalColor.gray)
+        table.setItem(row, 3, pct_item)
+        # Uncertainty
+        unc_item = QTableWidgetItem(f"{unc:.4f}")
+        if unc > 1.0:
+            unc_item.setForeground(Qt.GlobalColor.red)
+        elif unc > 0.5:
+            unc_item.setForeground(Qt.GlobalColor.darkYellow)
+        else:
+            unc_item.setForeground(Qt.GlobalColor.darkGreen)
+        table.setItem(row, 4, unc_item)
+        # Last close (use previous close)
+        last_item = QTableWidgetItem(f"{prev_close:.4f}" if prev_close is not None else "--")
+        table.setItem(row, 5, last_item)
+        # Trend
+        trend_item = QTableWidgetItem(trend)
+        trend_item.setForeground(trend_color)
+        table.setItem(row, 6, trend_item)
+        table.scrollToBottom()
+        # --- Sparkline update ---
+        if hasattr(self, '_lstm_sparkline_data'):
+            self._lstm_sparkline_data.append((ts, forecast, prev_close if prev_close is not None else 0, unc))
+            # Keep only last 100 points
+            if len(self._lstm_sparkline_data) > 100:
+                self._lstm_sparkline_data = self._lstm_sparkline_data[-100:]
+            x = list(range(len(self._lstm_sparkline_data)))
+            y_forecast = [d[1] for d in self._lstm_sparkline_data]
+            y_actual = [d[2] for d in self._lstm_sparkline_data]
+            y_unc = [d[1] + d[3] for d in self._lstm_sparkline_data]
+            if hasattr(self, '_lstm_sparkline_forecast') and self._lstm_sparkline_forecast is not None:
+                self._lstm_sparkline_forecast.setData(x, y_forecast)
+            if hasattr(self, '_lstm_sparkline_actual') and self._lstm_sparkline_actual is not None:
+                self._lstm_sparkline_actual.setData(x, y_actual)
+            if hasattr(self, '_lstm_sparkline_unc') and self._lstm_sparkline_unc is not None:
+                self._lstm_sparkline_unc.setData(x, y_unc)
+
+    def closeEvent(self, event):
+        if hasattr(self, 'lstm_streamer') and self.lstm_streamer is not None:
+            self.stop_lstm_stream()
+        event.accept()
 
 def compute_macd(close: pd.Series, fast: int = 12, slow: int = 26, signal: int = 9) -> pd.DataFrame:
     """
@@ -2004,6 +2440,86 @@ def compute_macd(close: pd.Series, fast: int = 12, slow: int = 26, signal: int =
         'macd_signal': macd_signal,
         'macd_hist': macd_hist
     }, index=close.index)
+
+# --- Ollama health check ---
+def ollama_is_running() -> bool:
+    """Check if Ollama is running locally by pinging the /api/tags endpoint."""
+    try:
+        resp = requests.get("http://localhost:11434/api/tags", timeout=2)
+        return resp.status_code == 200
+    except Exception:
+        return False
+
+def call_ollama_llm(prompt: str, model: str = "llama2", temperature: float = 0.2, max_tokens: int = 512) -> str:
+    """
+    Call the local Ollama LLM API with a prompt and return the response.
+    """
+    url = "http://localhost:11434/api/generate"
+    payload = {
+        "model": model,
+        "prompt": prompt,
+        "temperature": temperature,
+        "max_tokens": max_tokens,
+        "stream": False
+    }
+    try:
+        response = requests.post(url, json=payload, timeout=60)
+        response.raise_for_status()
+        data = response.json()
+        return data.get("response", "[No response from Ollama]")
+    except Exception as e:
+        return f"[Ollama API error: {e}]"
+
+from PyQt6.QtCore import QThread, pyqtSignal
+class TickerFetcher(QThread):
+    data_fetched = pyqtSignal(dict)
+    def __init__(self, get_symbol_func):
+        super().__init__()
+        self.get_symbol_func = get_symbol_func
+        self._running = True
+    def run(self):
+        import time
+        from Data.okx_public_data import fetch_okx_ticker
+        while self._running:
+            symbol = self.get_symbol_func()
+            try:
+                ticker = fetch_okx_ticker(symbol)
+                if ticker:
+                    self.data_fetched.emit(ticker)
+                else:
+                    self.data_fetched.emit({})
+            except Exception:
+                self.data_fetched.emit({})
+            time.sleep(1)
+    def stop(self):
+        self._running = False
+
+class LSTMTrainingWorker(QThread):
+    progress = pyqtSignal(str)
+    finished = pyqtSignal(object)
+    def __init__(self, X, y, input_size, model_path, epochs=30, batch_size=32, lr=1e-3):
+        super().__init__()
+        from src.analysis.lstm_regressor import LSTMRegressor
+        self.X = X
+        self.y = y
+        self.input_size = input_size
+        self.model_path = model_path
+        self.epochs = epochs
+        self.batch_size = batch_size
+        self.lr = lr
+        self.LSTMRegressor = LSTMRegressor
+    def run(self):
+        log_html = "<b>[ML Training]</b> Starting LSTM training...<br>"
+        model = self.LSTMRegressor(input_size=self.input_size)
+        def progress_callback(epoch, epochs, loss):
+            nonlocal log_html
+            log_html += f"Epoch {epoch}/{epochs} - Loss: {loss:.6f}<br>"
+            self.progress.emit(log_html)
+        model.fit(self.X, self.y, epochs=self.epochs, batch_size=self.batch_size, lr=self.lr, device=None, verbose=False, progress_callback=progress_callback)
+        model.save(self.model_path)
+        log_html += f"<b>[ML Training]</b> LSTM model saved to {self.model_path}<br>"
+        self.progress.emit(log_html)
+        self.finished.emit(model)
 
 if __name__ == "__main__":
     app = QApplication(sys.argv)
