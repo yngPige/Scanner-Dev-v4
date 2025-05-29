@@ -1403,6 +1403,130 @@ class MLAnalyzer:
             'recent_trend': trend
         }
 
+    def optimize_lstm_with_optuna(
+        self,
+        klines_data: pd.DataFrame,
+        n_trials: int = 20,
+        direction: str = "minimize",
+        study_name: str = "lstm_optuna_study",
+        storage: Optional[str] = None,
+        show_progress_bar: bool = True,
+        progress_callback: Optional[callable] = None,
+    ) -> optuna.Study:
+        """
+        Optimize LSTM hyperparameters using Optuna.
+        Args:
+            klines_data (pd.DataFrame): Historical price data for training/validation.
+            n_trials (int): Number of Optuna trials.
+            direction (str): "minimize" (for MAE/MSE).
+            study_name (str): Name for the Optuna study.
+            storage (Optional[str]): Optuna storage URI for persistent studies.
+            show_progress_bar (bool): Whether to show Optuna's progress bar.
+            progress_callback (callable, optional): Called with (trial_num, n_trials, best_score, best_params).
+        Returns:
+            optuna.Study: The Optuna study object with all trial results.
+        """
+        import optuna
+        import numpy as np
+        import torch
+        import os
+        from src.analysis.lstm_regressor import LSTMRegressor
+        from sklearn.model_selection import train_test_split
+        from sklearn.metrics import mean_absolute_error
+        # Prepare features/targets
+        df = klines_data.copy()
+        feature_cols = [c for c in df.columns if c not in ['timestamp', 'close']]
+        data = df[feature_cols].values.astype(np.float32)
+        targets = df['close'].values.astype(np.float32)
+        def objective(trial: optuna.Trial) -> float:
+            window_size = trial.suggest_int("window_size", 10, 100)
+            hidden_size = trial.suggest_categorical("hidden_size", [16, 32, 64, 128, 256])
+            num_layers = trial.suggest_int("num_layers", 1, 4)
+            dropout = trial.suggest_float("dropout", 0.0, 0.5)
+            learning_rate = trial.suggest_float("learning_rate", 1e-4, 1e-2, log=True)
+            batch_size = trial.suggest_categorical("batch_size", [16, 32, 64, 128])
+            epochs = trial.suggest_int("epochs", 10, 50)
+            uncertainty_iter = trial.suggest_int("uncertainty_iter", 10, 50)
+            # Windowed dataset
+            if len(data) <= window_size:
+                trial.report(np.inf, step=0)
+                return np.inf
+            X, y = LSTMRegressor.create_windowed_dataset(data, targets, window_size)
+            # Split train/val (last 20% for val)
+            n = len(X)
+            split = int(n * 0.8)
+            X_train, X_val = X[:split], X[split:]
+            y_train, y_val = y[:split], y[split:]
+            # Model
+            model = LSTMRegressor(
+                input_size=X.shape[2],
+                hidden_size=hidden_size,
+                num_layers=num_layers,
+                dropout=dropout
+            )
+            model.fit(
+                X_train, y_train,
+                epochs=epochs,
+                batch_size=batch_size,
+                lr=learning_rate,
+                device='cuda' if torch.cuda.is_available() else 'cpu',
+                verbose=False
+            )
+            y_pred = model.predict(X_val)
+            val_mae = mean_absolute_error(y_val, y_pred)
+            trial.set_user_attr("val_mae", val_mae)
+            trial.set_user_attr("params", {
+                "window_size": window_size,
+                "hidden_size": hidden_size,
+                "num_layers": num_layers,
+                "dropout": dropout,
+                "learning_rate": learning_rate,
+                "batch_size": batch_size,
+                "epochs": epochs,
+                "uncertainty_iter": uncertainty_iter
+            })
+            if progress_callback is not None:
+                best_trial = trial.study.best_trial if len(trial.study.trials) > 0 else None
+                best_score = best_trial.value if best_trial else None
+                best_params = best_trial.params if best_trial else None
+                progress_callback(trial.number + 1, n_trials, best_score, best_params)
+            return val_mae
+        study = optuna.create_study(
+            direction=direction,
+            study_name=study_name,
+            storage=storage,
+            load_if_exists=True
+        )
+        study.optimize(objective, n_trials=n_trials, show_progress_bar=show_progress_bar)
+        # Save best model and params
+        best_params = study.best_trial.params
+        best_window = best_params["window_size"]
+        X, y = LSTMRegressor.create_windowed_dataset(data, targets, best_window)
+        model = LSTMRegressor(
+            input_size=X.shape[2],
+            hidden_size=best_params["hidden_size"],
+            num_layers=best_params["num_layers"],
+            dropout=best_params["dropout"]
+        )
+        model.fit(
+            X, y,
+            epochs=best_params["epochs"],
+            batch_size=best_params["batch_size"],
+            lr=best_params["learning_rate"],
+            device='cuda' if torch.cuda.is_available() else 'cpu',
+            verbose=False
+        )
+        model_dir = "Models"
+        os.makedirs(model_dir, exist_ok=True)
+        model_path = os.path.join(model_dir, f"lstm_optuna_best.pt")
+        model.save(model_path)
+        # Save params
+        params_path = os.path.join(model_dir, f"lstm_optuna_best_params.json")
+        import json
+        with open(params_path, "w") as f:
+            json.dump(best_params, f, indent=2)
+        return study
+
 def format_ml_training_result(result: dict) -> str:
     lines = []
     lines.append(f"ML Model Training Summary")

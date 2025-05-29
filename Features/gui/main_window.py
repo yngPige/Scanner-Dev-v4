@@ -68,6 +68,8 @@ class MainWindow(QMainWindow):
         self.ml_analyzer = MLAnalyzer()
         self.pair_sources = {}  # Ensure pair_sources is always initialized
         self.ccxt_pair_cache = {}  # Added for caching CCXT pairs
+        # --- Ensure ccxt_exchanges is always initialized ---
+        self.ccxt_exchanges = ["binanceus", "okx", "kraken", "bybit", "kucoin"]
         # --- Initialize all attributes that may be referenced before assignment ---
         self.llm_output = None
         self.analysis_label = None
@@ -217,6 +219,16 @@ class MainWindow(QMainWindow):
         self.lstm_stream_output_button = QPushButton("Show LSTM Stream Output")
         self.lstm_stream_output_button.clicked.connect(self.show_lstm_stream_output_window)
         main_layout.addWidget(self.lstm_stream_output_button)
+
+        # Add Screener button
+        self.screener_button = QPushButton("Screener")
+        self.screener_button.clicked.connect(self.show_screener_window)
+        main_layout.addWidget(self.screener_button)
+
+        # Add Download All Pairs button
+        self.download_all_pairs_button = QPushButton("Download All Exchange Pairs (All Timeframes)")
+        self.download_all_pairs_button.clicked.connect(self.download_all_pairs_all_timeframes)
+        main_layout.addWidget(self.download_all_pairs_button)
 
         # Set main widget
         container = QWidget()
@@ -2145,42 +2157,6 @@ You are a quantitative analyst. Analyze the following OHLCV (Open, High, Low, Cl
         ])
         table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
         output_layout.addWidget(table)
-        # --- Sparkline Chart ---
-        import pyqtgraph as pg
-        self._lstm_sparkline_plot = pg.PlotWidget()
-        def set_chart_theme(dark):
-            if dark:
-                self._lstm_sparkline_plot.setBackground('k')
-                self._lstm_sparkline_plot.getAxis('left').setTextPen('w')
-                self._lstm_sparkline_plot.getAxis('bottom').setTextPen('w')
-                forecast_pen = pg.mkPen('c', width=2)
-                actual_pen = pg.mkPen('y', width=2)
-                unc_pen = pg.mkPen('m', width=1, style=Qt.PenStyle.DashLine)
-            else:
-                self._lstm_sparkline_plot.setBackground('w')
-                self._lstm_sparkline_plot.getAxis('left').setTextPen('k')
-                self._lstm_sparkline_plot.getAxis('bottom').setTextPen('k')
-                forecast_pen = pg.mkPen('b', width=2)
-                actual_pen = pg.mkPen('g', width=2)
-                unc_pen = pg.mkPen('y', width=1, style=Qt.PenStyle.DashLine)
-            self._lstm_sparkline_forecast.setPen(forecast_pen)
-            self._lstm_sparkline_actual.setPen(actual_pen)
-            self._lstm_sparkline_unc.setPen(unc_pen)
-        self._lstm_sparkline_plot.showGrid(x=True, y=True)
-        self._lstm_sparkline_plot.setYRange(0, 1)
-        self._lstm_sparkline_plot.setMinimumHeight(120)
-        self._lstm_sparkline_plot.addLegend()
-        self._lstm_sparkline_forecast = self._lstm_sparkline_plot.plot([], [], pen=pg.mkPen('b', width=2), name="Forecast")
-        self._lstm_sparkline_actual = self._lstm_sparkline_plot.plot([], [], pen=pg.mkPen('g', width=2), name="Last Close")
-        self._lstm_sparkline_unc = self._lstm_sparkline_plot.plot([], [], pen=pg.mkPen('y', width=1, style=Qt.PenStyle.DashLine), name="Uncertainty")
-        self._lstm_sparkline_data = []  # List of (timestamp, forecast, last_close, uncertainty)
-        output_layout.addWidget(self._lstm_sparkline_plot)
-        # Dark mode toggle logic
-        def on_darkmode_toggled():
-            set_chart_theme(self._lstm_darkmode_checkbox.isChecked())
-            self._lstm_darkmode_checkbox.setText("Disable Dark Mode" if self._lstm_darkmode_checkbox.isChecked() else "Enable Dark Mode")
-        self._lstm_darkmode_checkbox.toggled.connect(on_darkmode_toggled)
-        set_chart_theme(False)
         # Resource usage label
         self._lstm_resource_label = QLabel("CPU: -- | RAM: -- | GPU: --")
         output_layout.addWidget(self._lstm_resource_label)
@@ -2190,6 +2166,19 @@ You are a quantitative analyst. Analyze the following OHLCV (Open, High, Low, Cl
         # --- Settings Tab (unchanged) ---
         settings_tab = QWidget()
         settings_layout = QFormLayout()
+
+        # LSTM window size defaults by timeframe
+        LSTM_WINDOW_DEFAULTS = {
+            '5m': 60,
+            '15m': 40,
+            '30m': 30,
+            '1h': 24,
+            '4h': 20,
+            '1d': 14,
+            '1w': 8,
+            '1M': 6,
+        }
+
         interval_spin = QSpinBox()
         interval_spin.setRange(1, 3600)
         interval_spin.setValue(self.lstm_streamer.interval if self.lstm_streamer else 60)
@@ -2198,6 +2187,28 @@ You are a quantitative analyst. Analyze the following OHLCV (Open, High, Low, Cl
         window_spin.setRange(5, 200)
         window_spin.setValue(getattr(self.lstm_streamer, 'window_size', 30) if self.lstm_streamer else 30)
         settings_layout.addRow(QLabel("LSTM Window Size:"), window_spin)
+
+        # Add a label to confirm current window size and timeframe
+        window_confirm_label = QLabel()
+        window_confirm_label.setStyleSheet("color: #007acc; font-weight: bold;")
+        settings_layout.addRow(QLabel("Current LSTM Window Setting:"), window_confirm_label)
+
+        def update_window_confirm_label():
+            tf = self.timeframe_combo.currentText()
+            window_val = window_spin.value()
+            window_confirm_label.setText(f"Timeframe: <b>{tf}</b> | Window Size: <b>{window_val}</b>")
+
+        # Dynamically update window size based on timeframe
+        def update_lstm_window_spinbox():
+            tf = self.timeframe_combo.currentText()
+            default_window = LSTM_WINDOW_DEFAULTS.get(tf, 30)
+            window_spin.setValue(default_window)
+            update_window_confirm_label()
+        self.timeframe_combo.currentTextChanged.connect(update_lstm_window_spinbox)
+        window_spin.valueChanged.connect(update_window_confirm_label)
+        # Initialize window size and label on UI setup
+        update_lstm_window_spinbox()
+
         uncertainty_spin = QSpinBox()
         uncertainty_spin.setRange(1, 100)
         uncertainty_spin.setValue(getattr(self.lstm_streamer, 'uncertainty_iter', 20) if hasattr(self.lstm_streamer, 'uncertainty_iter') else 20)
@@ -2234,8 +2245,114 @@ You are a quantitative analyst. Analyze the following OHLCV (Open, High, Low, Cl
             )
         apply_btn.clicked.connect(apply_settings)
         settings_layout.addRow(apply_btn)
+
+        # --- LSTM Hyperparameter Tuning Button ---
+        tune_btn = QPushButton("Tune LSTM Hyperparameters")
+        settings_layout.addRow(tune_btn)
+
+        # --- Train LSTM from CSV Button ---
+        train_csv_btn = QPushButton("Train LSTM from CSV")
+        settings_layout.addRow(train_csv_btn)
+        train_csv_btn.clicked.connect(self.train_lstm_from_csv)
+
+        def show_lstm_tuning_dialog():
+            from PyQt6.QtWidgets import QDialog, QVBoxLayout, QLabel, QSpinBox, QPushButton, QTextEdit, QProgressBar
+            from PyQt6.QtCore import Qt, QThread, pyqtSignal
+            class LSTMOptunaWorker(QThread):
+                progress = pyqtSignal(int, int, float, dict)
+                finished = pyqtSignal(object)
+                error = pyqtSignal(str)
+                def __init__(self, analyzer, df, n_trials):
+                    super().__init__()
+                    self.analyzer = analyzer
+                    self.df = df
+                    self.n_trials = n_trials
+                def run(self):
+                    try:
+                        def cb(trial_num, n_trials, best_score, best_params):
+                            self.progress.emit(trial_num, n_trials, best_score if best_score is not None else float('inf'), best_params if best_params is not None else {})
+                        study = self.analyzer.optimize_lstm_with_optuna(self.df, n_trials=self.n_trials, progress_callback=cb)
+                        self.finished.emit(study)
+                    except Exception as e:
+                        self.error.emit(str(e))
+            # Dialog UI
+            dialog = QDialog()
+            dialog.setWindowTitle("LSTM Hyperparameter Tuning")
+            layout = QVBoxLayout()
+            layout.addWidget(QLabel("Number of Optuna Trials:"))
+            trial_spin = QSpinBox()
+            trial_spin.setRange(5, 100)
+            trial_spin.setValue(20)
+            layout.addWidget(trial_spin)
+            start_btn = QPushButton("Start Tuning")
+            layout.addWidget(start_btn)
+            progress_bar = QProgressBar()
+            progress_bar.setRange(0, 100)
+            progress_bar.setValue(0)
+            layout.addWidget(progress_bar)
+            result_box = QTextEdit()
+            result_box.setReadOnly(True)
+            layout.addWidget(result_box)
+            close_btn = QPushButton("Close")
+            close_btn.setEnabled(False)
+            layout.addWidget(close_btn)
+            dialog.setLayout(layout)
+            worker = None
+            def on_progress(trial_num, n_trials, best_score, best_params):
+                pct = int(100 * trial_num / n_trials)
+                progress_bar.setValue(pct)
+                txt = f"Trial {trial_num}/{n_trials}\nBest MAE: {best_score:.5f}\nBest Params: {json.dumps(best_params, indent=2)}"
+                result_box.setPlainText(txt)
+            def on_finished(study):
+                # Only show results if at least one trial completed successfully
+                completed_trials = [t for t in study.trials if t.state.name == 'COMPLETE']
+                if not completed_trials:
+                    result_box.setPlainText("No successful trials were completed. Please check your data and try again.")
+                else:
+                    best = study.best_trial
+                    txt = f"Tuning Complete!\nBest MAE: {best.value:.5f}\nBest Params:\n{json.dumps(best.params, indent=2)}"
+                    result_box.setPlainText(txt)
+                progress_bar.setValue(100)
+                close_btn.setEnabled(True)
+            def on_error(msg):
+                result_box.setPlainText(f"Error: {msg}")
+                close_btn.setEnabled(True)
+            def start_tuning():
+                nonlocal worker
+                n_trials = trial_spin.value()
+                result_box.setPlainText("Starting tuning...")
+                progress_bar.setValue(0)
+                close_btn.setEnabled(False)
+                # Use last_df_hist for tuning
+                df = getattr(self, 'last_df_hist', None)
+                if df is None or df.empty:
+                    result_box.setPlainText("No data available. Please fetch and analyze data first.")
+                    close_btn.setEnabled(True)
+                    return
+                worker = LSTMOptunaWorker(self.ml_analyzer, df, n_trials)
+                worker.progress.connect(on_progress)
+                worker.finished.connect(on_finished)
+                worker.error.connect(on_error)
+                worker.start()
+            start_btn.clicked.connect(start_tuning)
+            close_btn.clicked.connect(dialog.accept)
+            dialog.exec()
+        tune_btn.clicked.connect(show_lstm_tuning_dialog)
         settings_tab.setLayout(settings_layout)
         tab_widget.addTab(settings_tab, "Settings")
+        # Add tooltip to the Settings tab label
+        settings_tooltip = (
+            "<b>LSTM Stream Settings Controls:</b><br>"
+            "<ul>"
+            "<li><b>Streaming Interval (seconds):</b> How often to run the LSTM prediction.</li>"
+            "<li><b>LSTM Window Size:</b> Number of time steps used for each LSTM prediction window.</li>"
+            "<li><b>Uncertainty Iterations:</b> Number of MC dropout runs for uncertainty estimation.</li>"
+            "<li><b>Active Features/Indicators:</b> Features used as input to the LSTM model.</li>"
+            "<li><b>LSTM Model File:</b> (if multiple) Select which trained LSTM model to use.</li>"
+            "<li><b>Apply:</b> Apply the above settings to the running LSTM stream.</li>"
+            "</ul>"
+        )
+        tab_widget.setTabToolTip(1, settings_tooltip)
 
         main_layout.addWidget(tab_widget)
         close_btn = QPushButton("Close")
@@ -2247,23 +2364,57 @@ You are a quantitative analyst. Analyze the following OHLCV (Open, High, Low, Cl
         dialog.activateWindow()
 
         def on_close():
+            # Save LSTM stream output chart data and interval settings
+            import json
+            save_data = {}
+            # Save interval, window, uncertainty, and selected model if available
+            try:
+                interval = interval_spin.value()
+                window = window_spin.value()
+                uncertainty = uncertainty_spin.value()
+                selected_model = model_combo.currentText() if model_combo is not None else None
+                save_data['interval'] = interval
+                save_data['window'] = window
+                save_data['uncertainty'] = uncertainty
+                save_data['model_file'] = selected_model
+            except Exception:
+                pass
+            if save_data:
+                with open('lstm_stream_settings.json', 'w') as f:
+                    json.dump(save_data, f)
             self._lstm_stream_output_dialog = None
             self._lstm_stream_output_table = None
-            self._lstm_sparkline_plot = None
-            self._lstm_sparkline_data = []
+            self._lstm_resource_label = None
             if hasattr(self, '_lstm_resource_timer') and self._lstm_resource_timer is not None:
                 self._lstm_resource_timer.stop()
                 self._lstm_resource_timer = None
         dialog.finished.connect(on_close)
 
+        # Restore settings if file exists
+        import os, json
+        if os.path.exists('lstm_stream_settings.json'):
+            try:
+                with open('lstm_stream_settings.json', 'r') as f:
+                    settings = json.load(f)
+                # Restore interval, window, uncertainty, model
+                if 'interval' in settings:
+                    interval_spin.setValue(settings['interval'])
+                if 'window' in settings:
+                    window_spin.setValue(settings['window'])
+                if 'uncertainty' in settings:
+                    uncertainty_spin.setValue(settings['uncertainty'])
+                if 'model_file' in settings and model_combo is not None:
+                    idx = model_combo.findText(settings['model_file'])
+                    if idx >= 0:
+                        model_combo.setCurrentIndex(idx)
+            except Exception:
+                pass
+
         self._lstm_stream_output_dialog = dialog
         self._lstm_stream_output_table = table
         # Sparkline data buffer
         self._lstm_sparkline_data = []
-        self._lstm_sparkline_plot = self._lstm_sparkline_plot
-        self._lstm_sparkline_forecast = self._lstm_sparkline_forecast
-        self._lstm_sparkline_actual = self._lstm_sparkline_actual
-        self._lstm_sparkline_unc = self._lstm_sparkline_unc
+        self._lstm_resource_label = self._lstm_resource_label
 
         # --- Resource Usage Timer ---
         def update_resource_usage():
@@ -2418,6 +2569,340 @@ You are a quantitative analyst. Analyze the following OHLCV (Open, High, Low, Cl
         if hasattr(self, 'lstm_streamer') and self.lstm_streamer is not None:
             self.stop_lstm_stream()
         event.accept()
+
+    def show_screener_window(self):
+        from PyQt6.QtWidgets import QDialog, QVBoxLayout, QTableWidget, QTableWidgetItem, QPushButton, QHeaderView, QLineEdit, QLabel, QHBoxLayout, QMessageBox
+        from PyQt6.QtCore import Qt
+        import threading
+
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Token/Pairs Screener")
+        dialog.setGeometry(300, 300, 1200, 700)
+        layout = QVBoxLayout()
+
+        # Filter bar
+        filter_layout = QHBoxLayout()
+        filter_input = QLineEdit()
+        filter_input.setPlaceholderText("Filter by pair, exchange, or signal...")
+        filter_layout.addWidget(QLabel("Filter:"))
+        filter_layout.addWidget(filter_input)
+        layout.addLayout(filter_layout)
+
+        # Table
+        columns = ["Pair", "Exchange", "Price", "Change %", "Volume", "ML Signal"]
+        table = QTableWidget(0, len(columns))
+        table.setHorizontalHeaderLabels(columns)
+        table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
+        layout.addWidget(table)
+
+        # Status label
+        status_label = QLabel("Loading...")
+        layout.addWidget(status_label)
+
+        # Print number of pairs for debug
+        print(f"[Screener] Number of pairs in pair_sources: {len(self.pair_sources)}")
+        if not self.pair_sources:
+            QMessageBox.warning(self, "Screener", "No pairs available to screen. Please fetch data first.")
+            return
+
+        # Fetch and populate data in a background thread
+        def fetch_and_populate():
+            rows = []
+            pairs = list(self.pair_sources.items())[:50]  # Limit for speed
+            for idx, (pair, sources) in enumerate(pairs):
+                exchange = sources[0]
+                try:
+                    ohlcv = fetch_ohlcv(exchange, pair, "1h", limit=30)
+                    if ohlcv:
+                        last = ohlcv[-1]
+                        price = last[4]
+                        open_ = last[1]
+                        change_pct = ((price - open_) / open_ * 100) if open_ else 0
+                        volume = last[5]
+                        # Prepare DataFrame for ML
+                        import pandas as pd
+                        df = pd.DataFrame(ohlcv, columns=["timestamp", "open", "high", "low", "close", "volume"])
+                        # Add indicators (use your helper)
+                        try:
+                            df = self.add_technical_indicators(df)
+                        except Exception as e:
+                            print(f"[Screener] Error adding indicators for {pair}: {e}")
+                        # Run ML signal (fast, no LLM, no heavy features)
+                        try:
+                            ml_result = self.ml_analyzer.analyze_market_data(
+                                symbol=pair,
+                                klines_data=df,
+                                additional_context={"timeframe": "1h"}
+                            )
+                            ml_signal = ml_result.get("recommendation", "--")
+                        except Exception as e:
+                            print(f"[Screener] Error running ML for {pair}: {e}")
+                            ml_signal = "--"
+                        rows.append([pair, exchange, f"{price:.4f}", f"{change_pct:+.2f}%", f"{volume:.0f}", ml_signal, change_pct])
+                    else:
+                        print(f"[Screener] No OHLCV data for {pair} on {exchange}")
+                        rows.append([pair, exchange, "--", "--", "--", "--", float('-inf')])
+                except Exception as e:
+                    print(f"[Screener] Error fetching {pair} on {exchange}: {e}")
+                    rows.append([pair, exchange, "--", "--", "--", "--", float('-inf')])
+                # Update status
+                self.run_on_main_thread(lambda idx=idx: status_label.setText(f"Loaded {idx+1}/{len(pairs)} pairs..."))
+            # Sort: ML Signal (BUY > SELL > others), then by change % descending
+            def ml_sort_key(row):
+                signal = row[5].upper()
+                if "BUY" in signal:
+                    return (0, -row[6])
+                elif "SELL" in signal:
+                    return (1, -row[6])
+                else:
+                    return (2, -row[6])
+            rows.sort(key=ml_sort_key)
+            # Populate table in the main thread
+            def update_table():
+                table.setRowCount(len(rows))
+                for i, row in enumerate(rows):
+                    for j, val in enumerate(row[:6]):
+                        item = QTableWidgetItem(str(val))
+                        if j == 3:  # Change %
+                            item.setForeground(Qt.GlobalColor.green if "+" in str(val) else Qt.GlobalColor.red)
+                        if j == 5:  # ML Signal
+                            if "BUY" in str(val).upper():
+                                item.setForeground(Qt.GlobalColor.green)
+                            elif "SELL" in str(val).upper():
+                                item.setForeground(Qt.GlobalColor.red)
+                            else:
+                                item.setForeground(Qt.GlobalColor.gray)
+                        table.setItem(i, j, item)
+                status_label.setText("Done.")
+            self.run_on_main_thread(update_table)
+        threading.Thread(target=fetch_and_populate, daemon=True).start()
+
+        # Filter logic
+        def filter_table():
+            text = filter_input.text().lower()
+            for row in range(table.rowCount()):
+                show = any(text in (table.item(row, col).text().lower() if table.item(row, col) else "") for col in range(table.columnCount()))
+                table.setRowHidden(row, not show)
+        filter_input.textChanged.connect(filter_table)
+
+        # Double-click to select pair
+        def on_row_double_clicked(row, col):
+            pair = table.item(row, 0).text()
+            self.select_pair_button.setText(pair)
+            dialog.accept()
+            self.fetch_data()
+        table.cellDoubleClicked.connect(on_row_double_clicked)
+
+        close_btn = QPushButton("Close")
+        close_btn.clicked.connect(dialog.accept)
+        layout.addWidget(close_btn)
+        dialog.setLayout(layout)
+        dialog.exec()
+
+    def run_on_main_thread(self, func):
+        from PyQt6.QtCore import QTimer
+        QTimer.singleShot(0, func)
+
+    def train_lstm_from_csv(self):
+        from PyQt6.QtWidgets import QFileDialog, QMessageBox, QDialog, QVBoxLayout, QLabel, QSpinBox, QPushButton, QHBoxLayout
+        import pandas as pd
+        import os
+        import numpy as np
+        # --- Dialog for config ---
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Train LSTM from CSV(s)")
+        layout = QVBoxLayout()
+        layout.addWidget(QLabel("Select one or more CSV files with market data."))
+        # Window size
+        window_label = QLabel("LSTM Window Size (optimal suggested):")
+        window_spin = QSpinBox()
+        window_spin.setRange(5, 200)
+        window_spin.setValue(30)  # Optimal default
+        layout.addWidget(window_label)
+        layout.addWidget(window_spin)
+        # Epochs
+        epochs_label = QLabel("Epochs (optimal suggested):")
+        epochs_spin = QSpinBox()
+        epochs_spin.setRange(5, 200)
+        epochs_spin.setValue(30)  # Optimal default
+        layout.addWidget(epochs_label)
+        layout.addWidget(epochs_spin)
+        # File select
+        file_btn = QPushButton("Select CSV Files")
+        file_label = QLabel("No files selected.")
+        layout.addWidget(file_btn)
+        layout.addWidget(file_label)
+        selected_files = []
+        def select_files():
+            files, _ = QFileDialog.getOpenFileNames(dialog, "Select Market Data CSVs", "", "CSV Files (*.csv)")
+            if files:
+                selected_files.clear()
+                selected_files.extend(files)
+                file_label.setText("\n".join(os.path.basename(f) for f in files))
+            else:
+                file_label.setText("No files selected.")
+        file_btn.clicked.connect(select_files)
+        # Train button
+        train_btn = QPushButton("Train LSTM")
+        layout.addWidget(train_btn)
+        # Status label
+        status_label = QLabel()
+        layout.addWidget(status_label)
+        # Close button
+        close_btn = QPushButton("Close")
+        close_btn.clicked.connect(dialog.accept)
+        layout.addWidget(close_btn)
+        dialog.setLayout(layout)
+        # --- Training logic ---
+        def train():
+            if not selected_files:
+                QMessageBox.critical(dialog, "No Files", "Please select at least one CSV file.")
+                return
+            window = window_spin.value()
+            epochs = epochs_spin.value()
+            all_features = []
+            all_targets = []
+            feature_cols = None
+            for file_path in selected_files:
+                try:
+                    df = pd.read_csv(file_path)
+                    required_cols = {"timestamp", "open", "high", "low", "close", "volume"}
+                    if not required_cols.issubset(df.columns):
+                        status_label.setText(f"File {os.path.basename(file_path)} missing required columns.")
+                        return
+                    df = self.add_technical_indicators(df)
+                    # Use same features for all files
+                    if feature_cols is None:
+                        feature_cols = [c for c in df.columns if c not in ['timestamp', 'close']]
+                    features = df[feature_cols].values.astype(np.float32)
+                    targets = df['close'].values.astype(np.float32)
+                    from src.analysis.lstm_regressor import LSTMRegressor
+                    X, y = LSTMRegressor.create_windowed_dataset(features, targets, window)
+                    if X.shape[0] == 0:
+                        status_label.setText(f"File {os.path.basename(file_path)}: Not enough data for window size {window}.")
+                        return
+                    all_features.append(X)
+                    all_targets.append(y)
+                except Exception as e:
+                    status_label.setText(f"Error processing {os.path.basename(file_path)}: {e}")
+                    return
+            # Concatenate all
+            X = np.concatenate(all_features, axis=0)
+            y = np.concatenate(all_targets, axis=0)
+            input_size = X.shape[2] if X.ndim == 3 else len(feature_cols)
+            try:
+                from src.analysis.lstm_regressor import LSTMRegressor
+                model = LSTMRegressor(input_size=input_size)
+                status_label.setText("Training LSTM...")
+                dialog.repaint()
+                model.fit(X, y, epochs=epochs, batch_size=32, lr=1e-3, device=None, verbose=True)
+                model_path = os.path.join("Models", "lstm_from_csv.pt")
+                model.save(model_path)
+                QMessageBox.information(dialog, "LSTM Training", f"LSTM trained and saved to {model_path}")
+                self.ml_analyzer.model = model  # Use for forecasting
+                status_label.setText(f"Training complete. Model saved to {model_path} and ready for forecasting.")
+            except Exception as e:
+                QMessageBox.critical(dialog, "Training Error", f"Error during LSTM training: {e}")
+                status_label.setText(f"Error during training: {e}")
+        train_btn.clicked.connect(train)
+        dialog.exec()
+
+    def download_all_pairs_all_timeframes(self):
+        from PyQt6.QtWidgets import QDialog, QVBoxLayout, QLabel, QPushButton, QProgressDialog, QMessageBox
+        import time
+        import traceback
+        # Confirm dialog
+        confirm = QMessageBox.question(self, "Download All Pairs", "This will download OHLCV data for ALL pairs from all connected exchanges and all timeframes. This may take a long time and use significant bandwidth. Continue?", QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
+        if confirm != QMessageBox.StandardButton.Yes:
+            return
+        # Gather all pairs and exchanges
+        okx_pairs = set()
+        try:
+            from Data.okx_public_data import fetch_okx_ticker
+            tickers = fetch_okx_ticker(None, all_markets=True)
+            okx_pairs = set(
+                t['instId'].replace("-", "/")
+                for t in tickers if 'instId' in t and t['instId'].endswith('-USDT')
+            )
+        except Exception as e:
+            okx_pairs = set()
+        ccxt_pairs_by_exchange = {}
+        for exch in self.ccxt_exchanges:
+            try:
+                pairs = self.get_ccxt_pairs(exch)
+                ccxt_pairs_by_exchange[exch] = pairs
+            except Exception as e:
+                ccxt_pairs_by_exchange[exch] = set()
+        # Timeframes
+        timeframes = ["5m", "15m", "30m", "1h", "4h", "1d"]
+        # Count total tasks
+        total_tasks = len(okx_pairs) * len(timeframes) + sum(len(pairs) for pairs in ccxt_pairs_by_exchange.values()) * len(timeframes)
+        progress = QProgressDialog("Downloading all pairs...", "Cancel", 0, total_tasks, self)
+        progress.setWindowTitle("Download Progress")
+        progress.setWindowModality(Qt.WindowModality.ApplicationModal)
+        progress.setMinimumDuration(0)
+        progress.setValue(0)
+        progress.show()
+        QApplication.processEvents()
+        # Download OKX pairs
+        from src.utils.data_storage import save_ohlcv
+        from src.utils.helpers import fetch_ohlcv
+        task = 0
+        errors = []
+        for pair in okx_pairs:
+            for tf in timeframes:
+                if progress.wasCanceled():
+                    progress.close()
+                    QMessageBox.information(self, "Download Cancelled", "Download was cancelled by the user.")
+                    return
+                try:
+                    ohlcv = fetch_ohlcv("OKX", pair, tf, limit=1000)
+                    if ohlcv:
+                        save_ohlcv(pair, tf, ohlcv)
+                    else:
+                        errors.append(f"No data for {pair} ({tf}) [OKX]")
+                except Exception as e:
+                    errors.append(f"Error {pair} ({tf}) [OKX]: {e}")
+                task += 1
+                progress.setValue(task)
+                QApplication.processEvents()
+        # Download CCXT pairs
+        for exch, pairs in ccxt_pairs_by_exchange.items():
+            for pair in pairs:
+                for tf in timeframes:
+                    # Map to valid CCXT timeframe for this exchange
+                    mapped_tf = self.get_ccxt_timeframe(exch, tf)
+                    # Check if mapped_tf is valid for this exchange
+                    try:
+                        import ccxt
+                        exchange_class = getattr(ccxt, exch.lower())
+                        exchange = exchange_class()
+                        valid_timeframes = set(getattr(exchange, 'timeframes', {}).keys())
+                    except Exception:
+                        valid_timeframes = set()
+                    if mapped_tf not in valid_timeframes:
+                        errors.append(f"Skipped {pair} ({tf}) [CCXT:{exch}]: Invalid timeframe '{tf}'. Must be one of {valid_timeframes}")
+                        continue
+                    if progress.wasCanceled():
+                        progress.close()
+                        QMessageBox.information(self, "Download Cancelled", "Download was cancelled by the user.")
+                        return
+                    try:
+                        ohlcv = fetch_ohlcv(f"ccxt:{exch}", pair, mapped_tf, limit=1000)
+                        if ohlcv:
+                            save_ohlcv(pair, mapped_tf, ohlcv)
+                        else:
+                            errors.append(f"No data for {pair} ({mapped_tf}) [CCXT:{exch}]")
+                    except Exception as e:
+                        errors.append(f"Error {pair} ({mapped_tf}) [CCXT:{exch}]: {e}")
+                    task += 1
+                    progress.setValue(task)
+                    QApplication.processEvents()
+        progress.close()
+        if errors:
+            QMessageBox.warning(self, "Download Complete (with errors)", f"Some pairs failed to download.\n\n" + "\n".join(errors[:20]) + ("\n..." if len(errors) > 20 else ""))
+        else:
+            QMessageBox.information(self, "Download Complete", "All pairs downloaded successfully.")
 
 def compute_macd(close: pd.Series, fast: int = 12, slow: int = 26, signal: int = 9) -> pd.DataFrame:
     """

@@ -31,7 +31,7 @@
   - Enhanced, color-coded real-time table (forecast, delta, percent change, uncertainty, trend)
   - Real-time sparkline chart (forecast, previous close, uncertainty band)
   - Dark mode toggle for the chart
-  - Resource usage display (CPU, RAM, GPU)
+  - Resource usage display (CPU, RAM, GPU)f
 
 ---
 
