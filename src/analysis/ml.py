@@ -279,11 +279,13 @@ class MLAnalyzer:
 
         return y, df
 
-    def train_model(self, klines_data):
+    def train_model(self, klines_data, symbol: str = None, timeframe: str = None):
         """
         Train the pipeline model on historical data.
         Args:
             klines_data: DataFrame with historical price data
+            symbol (str, optional): Trading pair symbol (e.g., BTCUSDT)
+            timeframe (str, optional): Timeframe (e.g., 1h)
         Returns:
             Dictionary with training results
         """
@@ -291,13 +293,11 @@ class MLAnalyzer:
         start_time = time.time()
         if self.algorithm == "LSTM":
             df = klines_data.copy()
-            # Use all columns except timestamp and close as features
             feature_cols = [c for c in df.columns if c not in ['timestamp', 'close']]
             target_col = 'close'
             data = df[feature_cols].values
             targets = df[target_col].values
             window = getattr(config, 'LSTM_WINDOW', 30)
-            # Create windowed dataset
             X, y = LSTMRegressor.create_windowed_dataset(data, targets, window)
             if len(X) == 0:
                 return {'error': 'Not enough data for LSTM training', 'timestamp': datetime.now().isoformat()}
@@ -316,10 +316,13 @@ class MLAnalyzer:
             )
             self.model = model
             self.lstm_window = window
-            # Save model
-            model_path = os.path.join(self.model_dir, f"lstm_regressor.pt")
+            # Save model with pair and timeframe
+            if symbol is not None and timeframe is not None:
+                norm_pair = symbol.replace('/', '-')
+                model_path = os.path.join(self.model_dir, f"lstm_{norm_pair}_{timeframe}.pt")
+            else:
+                model_path = os.path.join(self.model_dir, f"lstm_regressor.pt")
             model.save(model_path)
-            # Evaluate on train set (or split for validation)
             preds = model.predict(X)
             mse = np.mean((preds - y) ** 2)
             training_time = time.time() - start_time
@@ -327,7 +330,8 @@ class MLAnalyzer:
                 'algorithm': 'LSTM',
                 'mse': mse,
                 'training_time': training_time,
-                'timestamp': datetime.now().isoformat()
+                'timestamp': datetime.now().isoformat(),
+                'model_path': model_path
             }
         # Step 1: Feature engineering and cleaning BEFORE split
         klines_data = calculate_technical_indicators(klines_data)
@@ -1412,9 +1416,11 @@ class MLAnalyzer:
         storage: Optional[str] = None,
         show_progress_bar: bool = True,
         progress_callback: Optional[callable] = None,
+        symbol: str = None,
+        timeframe: str = None,
     ) -> optuna.Study:
         """
-        Optimize LSTM hyperparameters using Optuna.
+        Optimize LSTM hyperparameters using Optuna with persistent SQLite storage and save best model/params.
         Args:
             klines_data (pd.DataFrame): Historical price data for training/validation.
             n_trials (int): Number of Optuna trials.
@@ -1423,6 +1429,8 @@ class MLAnalyzer:
             storage (Optional[str]): Optuna storage URI for persistent studies.
             show_progress_bar (bool): Whether to show Optuna's progress bar.
             progress_callback (callable, optional): Called with (trial_num, n_trials, best_score, best_params).
+            symbol (str, optional): Trading pair symbol for model naming.
+            timeframe (str, optional): Timeframe for model naming.
         Returns:
             optuna.Study: The Optuna study object with all trial results.
         """
@@ -1433,6 +1441,7 @@ class MLAnalyzer:
         from src.analysis.lstm_regressor import LSTMRegressor
         from sklearn.model_selection import train_test_split
         from sklearn.metrics import mean_absolute_error
+        import json
         # Prepare features/targets
         df = klines_data.copy()
         feature_cols = [c for c in df.columns if c not in ['timestamp', 'close']]
@@ -1491,6 +1500,13 @@ class MLAnalyzer:
                 best_params = best_trial.params if best_trial else None
                 progress_callback(trial.number + 1, n_trials, best_score, best_params)
             return val_mae
+        # --- Persistent storage ---
+        if storage is None:
+            storage = "sqlite:///optuna_studies.db"
+        # --- Study name includes pair and timeframe ---
+        if symbol is not None and timeframe is not None:
+            norm_pair = symbol.replace('/', '-')
+            study_name = f"lstm_{norm_pair}_{timeframe}_optuna"
         study = optuna.create_study(
             direction=direction,
             study_name=study_name,
@@ -1518,14 +1534,30 @@ class MLAnalyzer:
         )
         model_dir = "Models"
         os.makedirs(model_dir, exist_ok=True)
-        model_path = os.path.join(model_dir, f"lstm_optuna_best.pt")
+        if symbol is not None and timeframe is not None:
+            model_path = os.path.join(model_dir, f"lstm_{norm_pair}_{timeframe}_optuna.pt")
+            params_path = os.path.join(model_dir, f"lstm_{norm_pair}_{timeframe}_optuna_params.json")
+        else:
+            model_path = os.path.join(model_dir, f"lstm_optuna_best.pt")
+            params_path = os.path.join(model_dir, f"lstm_optuna_best_params.json")
         model.save(model_path)
-        # Save params
-        params_path = os.path.join(model_dir, f"lstm_optuna_best_params.json")
-        import json
         with open(params_path, "w") as f:
             json.dump(best_params, f, indent=2)
         return study
+
+    @staticmethod
+    def launch_optuna_dashboard(storage: str = "sqlite:///optuna_studies.db", port: int = 8080):
+        """
+        Launch the Optuna dashboard for interactive study visualization.
+        Args:
+            storage (str): The Optuna storage URI (e.g., 'sqlite:///optuna_studies.db').
+            port (int): The port to run the dashboard on (default: 8080).
+        """
+        import subprocess
+        print(f"Launching Optuna dashboard at http://localhost:{port} ...")
+        subprocess.Popen([
+            "optuna", "dashboard", storage, "--port", str(port)
+        ])
 
 def format_ml_training_result(result: dict) -> str:
     lines = []

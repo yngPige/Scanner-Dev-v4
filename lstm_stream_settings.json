@@ -1,1 +1,1 @@
-{"interval": 900, "window": 40, "uncertainty": 20, "model_file": "lstm_from_csv.pt"}
+{"interval": 60, "window": 40, "uncertainty": 20, "model_file": "lstm_regressor.pt"}

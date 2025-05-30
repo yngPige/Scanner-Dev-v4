@@ -10,7 +10,7 @@ import importlib.util
 from typing import Any, List, Optional
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
-    QLabel, QComboBox, QLineEdit, QPushButton, QTextEdit, QTableWidget, QTableWidgetItem, QAbstractItemView, QDoubleSpinBox, QSpinBox, QInputDialog, QMessageBox, QProgressBar, QCompleter, QDialog, QListWidget, QDialogButtonBox, QCheckBox, QTabWidget, QScrollArea, QToolButton, QProgressDialog, QFormLayout
+    QLabel, QComboBox, QLineEdit, QPushButton, QTextEdit, QTableWidget, QTableWidgetItem, QAbstractItemView, QDoubleSpinBox, QSpinBox, QInputDialog, QMessageBox, QProgressBar, QCompleter, QDialog, QListWidget, QDialogButtonBox, QCheckBox, QTabWidget, QScrollArea, QToolButton, QProgressDialog, QFormLayout, QFileDialog
 )
 from PyQt6.QtCore import Qt, QThread, pyqtSignal, QTimer, QUrl
 from PyQt6.QtGui import QIcon
@@ -221,8 +221,8 @@ class MainWindow(QMainWindow):
         main_layout.addWidget(self.lstm_stream_output_button)
 
         # Add Screener button
-        self.screener_button = QPushButton("Screener")
-        self.screener_button.clicked.connect(self.show_screener_window)
+        self.screener_button = QPushButton("Screener (WIP)")
+        self.screener_button.setEnabled(False)
         main_layout.addWidget(self.screener_button)
 
         # Add Download All Pairs button
@@ -946,6 +946,7 @@ You are a quantitative analyst. Analyze the following OHLCV (Open, High, Low, Cl
             self.progress_bar.setVisible(False)
             self.show_analysis_window(log_html)
             return
+        any_downloaded = False
         for idx, tf in enumerate(timeframes):
             limit = bars_per_month.get(tf, 30)
             # Check if data is already downloaded and recent
@@ -963,7 +964,6 @@ You are a quantitative analyst. Analyze the following OHLCV (Open, High, Low, Cl
                 if (now - last_dt) < timedelta(hours=24):
                     skip = True
             if skip:
-                log_html += f"<b>[Download]</b> Skipping {pair} ({tf}) [{exchange_label}] - already downloaded and recent.<br>"
                 # Smooth progress bar animation for skipped
                 current_val = self.progress_bar.value()
                 target_val = current_val + 1
@@ -979,8 +979,10 @@ You are a quantitative analyst. Analyze the following OHLCV (Open, High, Low, Cl
             if ohlcv:
                 save_ohlcv(pair, tf, ohlcv)
                 log_html += f"<b>[Download]</b> Saved {len(ohlcv)} rows for {pair} ({tf}) [{exchange_label}]<br>"
+                any_downloaded = True
             else:
                 log_html += f"<b>[Download]</b> Failed to fetch data for {pair} ({tf}) [{exchange_label}]<br>"
+                any_downloaded = True
             # Smooth progress bar animation
             current_val = self.progress_bar.value()
             target_val = current_val + 1
@@ -990,8 +992,10 @@ You are a quantitative analyst. Analyze the following OHLCV (Open, High, Low, Cl
                 QApplication.processEvents()
                 time.sleep(0.03)
         self.progress_bar.setVisible(False)
-        log_html += f"<b>[Download]</b> A month of all timeframes downloaded for {pair} ({exchange_label}).<br>"
-        self.show_analysis_window(log_html)
+        if any_downloaded:
+            log_html += f"<b>[Download]</b> A month of all timeframes downloaded for {pair} ({exchange_label}).<br>"
+            self.show_analysis_window(log_html)
+        # If nothing was downloaded, do not show the window or log.
 
     def toggle_chart_window(self, checked: bool):
         """
@@ -1719,7 +1723,7 @@ You are a quantitative analyst. Analyze the following OHLCV (Open, High, Low, Cl
                 self.optuna_worker.start()
                 return
         # --- Standard training ---
-        results = self.ml_analyzer.train_model(df_hist)
+        results = self.ml_analyzer.train_model(df_hist, symbol=symbol, timeframe=norm_timeframe)
         # Save the regular model
         try:
             if hasattr(self.ml_analyzer, 'pipeline_'):
@@ -1740,8 +1744,8 @@ You are a quantitative analyst. Analyze the following OHLCV (Open, High, Low, Cl
                 targets = df_hist['close'].values.astype(np.float32)
                 X, y = LSTMRegressor.create_windowed_dataset(features, targets, window)
                 input_size = X.shape[2] if X.ndim == 3 else len(feature_cols)
-                model_base = f"model_{symbol.replace('/', '-')}_{norm_timeframe}_{self.selected_algorithm}"
-                model_path = os.path.join("Models", model_base + ".pt")
+                norm_pair = symbol.replace('/', '-')
+                model_path = os.path.join("Models", f"lstm_{norm_pair}_{norm_timeframe}.pt")
                 log_html = "<b>[ML Training]</b> Preparing to train LSTM..."
                 self.show_analysis_window(log_html, closable=False)
                 self.lstm_worker = LSTMTrainingWorker(X, y, input_size, model_path)
@@ -2146,11 +2150,15 @@ You are a quantitative analyst. Analyze the following OHLCV (Open, High, Low, Cl
         # --- Stream Output Tab ---
         output_tab = QWidget()
         output_layout = QVBoxLayout()
-        # Dark mode toggle
-        self._lstm_darkmode_checkbox = QPushButton("Enable Dark Mode")
-        self._lstm_darkmode_checkbox.setCheckable(True)
-        self._lstm_darkmode_checkbox.setChecked(False)
-        output_layout.addWidget(self._lstm_darkmode_checkbox)
+        # Optuna Dashboard button
+        self._optuna_dashboard_btn = QPushButton("Optuna Dashboard")
+        output_layout.addWidget(self._optuna_dashboard_btn)
+        def launch_dashboard():
+            from src.analysis.ml import MLAnalyzer
+            MLAnalyzer.launch_optuna_dashboard()
+            from PyQt6.QtWidgets import QMessageBox
+            QMessageBox.information(dialog, "Optuna Dashboard", "Optuna dashboard launched at http://localhost:8080. Open this URL in your browser.")
+        self._optuna_dashboard_btn.clicked.connect(launch_dashboard)
         table = QTableWidget(0, 7)
         table.setHorizontalHeaderLabels([
             "Timestamp", "Forecast", "Δ", "% Change", "Uncertainty", "Last Close", "Trend"
@@ -2501,12 +2509,12 @@ You are a quantitative analyst. Analyze the following OHLCV (Open, High, Low, Cl
         delta = result.get('delta', 0)
         pct = result.get('percent_change', 0)
         unc = result.get('uncertainty', 0)
-        # --- PATCH: Track previous close ---
-        if not hasattr(self, '_lstm_prev_close'):
-            self._lstm_prev_close = None
-        prev_close = self._lstm_prev_close
-        # Update for next call
-        self._lstm_prev_close = result.get('last_close', 0)
+        # Get the actual last close from the result or from the latest data
+        last_close = result.get('last_close')
+        if last_close is None:
+            last_df = getattr(self, 'last_df_hist', None)
+            if last_df is not None and not last_df.empty and 'close' in last_df.columns:
+                last_close = last_df['close'].iloc[-1]
         # Trend arrow
         if delta > 0.0001:
             trend = '↑'
@@ -2540,8 +2548,8 @@ You are a quantitative analyst. Analyze the following OHLCV (Open, High, Low, Cl
         else:
             unc_item.setForeground(Qt.GlobalColor.darkGreen)
         table.setItem(row, 4, unc_item)
-        # Last close (use previous close)
-        last_item = QTableWidgetItem(f"{prev_close:.4f}" if prev_close is not None else "--")
+        # Last close (always up-to-date)
+        last_item = QTableWidgetItem(f"{last_close:.4f}" if last_close is not None else "--")
         table.setItem(row, 5, last_item)
         # Trend
         trend_item = QTableWidgetItem(trend)
@@ -2550,7 +2558,7 @@ You are a quantitative analyst. Analyze the following OHLCV (Open, High, Low, Cl
         table.scrollToBottom()
         # --- Sparkline update ---
         if hasattr(self, '_lstm_sparkline_data'):
-            self._lstm_sparkline_data.append((ts, forecast, prev_close if prev_close is not None else 0, unc))
+            self._lstm_sparkline_data.append((ts, forecast, last_close if last_close is not None else 0, unc))
             # Keep only last 100 points
             if len(self._lstm_sparkline_data) > 100:
                 self._lstm_sparkline_data = self._lstm_sparkline_data[-100:]
@@ -2569,243 +2577,6 @@ You are a quantitative analyst. Analyze the following OHLCV (Open, High, Low, Cl
         if hasattr(self, 'lstm_streamer') and self.lstm_streamer is not None:
             self.stop_lstm_stream()
         event.accept()
-
-    def show_screener_window(self):
-        from PyQt6.QtWidgets import QDialog, QVBoxLayout, QTableWidget, QTableWidgetItem, QPushButton, QHeaderView, QLineEdit, QLabel, QHBoxLayout, QMessageBox
-        from PyQt6.QtCore import Qt
-        import threading
-
-        dialog = QDialog(self)
-        dialog.setWindowTitle("Token/Pairs Screener")
-        dialog.setGeometry(300, 300, 1200, 700)
-        layout = QVBoxLayout()
-
-        # Filter bar
-        filter_layout = QHBoxLayout()
-        filter_input = QLineEdit()
-        filter_input.setPlaceholderText("Filter by pair, exchange, or signal...")
-        filter_layout.addWidget(QLabel("Filter:"))
-        filter_layout.addWidget(filter_input)
-        layout.addLayout(filter_layout)
-
-        # Table
-        columns = ["Pair", "Exchange", "Price", "Change %", "Volume", "ML Signal"]
-        table = QTableWidget(0, len(columns))
-        table.setHorizontalHeaderLabels(columns)
-        table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
-        layout.addWidget(table)
-
-        # Status label
-        status_label = QLabel("Loading...")
-        layout.addWidget(status_label)
-
-        # Print number of pairs for debug
-        print(f"[Screener] Number of pairs in pair_sources: {len(self.pair_sources)}")
-        if not self.pair_sources:
-            QMessageBox.warning(self, "Screener", "No pairs available to screen. Please fetch data first.")
-            return
-
-        # Fetch and populate data in a background thread
-        def fetch_and_populate():
-            rows = []
-            pairs = list(self.pair_sources.items())[:50]  # Limit for speed
-            for idx, (pair, sources) in enumerate(pairs):
-                exchange = sources[0]
-                try:
-                    ohlcv = fetch_ohlcv(exchange, pair, "1h", limit=30)
-                    if ohlcv:
-                        last = ohlcv[-1]
-                        price = last[4]
-                        open_ = last[1]
-                        change_pct = ((price - open_) / open_ * 100) if open_ else 0
-                        volume = last[5]
-                        # Prepare DataFrame for ML
-                        import pandas as pd
-                        df = pd.DataFrame(ohlcv, columns=["timestamp", "open", "high", "low", "close", "volume"])
-                        # Add indicators (use your helper)
-                        try:
-                            df = self.add_technical_indicators(df)
-                        except Exception as e:
-                            print(f"[Screener] Error adding indicators for {pair}: {e}")
-                        # Run ML signal (fast, no LLM, no heavy features)
-                        try:
-                            ml_result = self.ml_analyzer.analyze_market_data(
-                                symbol=pair,
-                                klines_data=df,
-                                additional_context={"timeframe": "1h"}
-                            )
-                            ml_signal = ml_result.get("recommendation", "--")
-                        except Exception as e:
-                            print(f"[Screener] Error running ML for {pair}: {e}")
-                            ml_signal = "--"
-                        rows.append([pair, exchange, f"{price:.4f}", f"{change_pct:+.2f}%", f"{volume:.0f}", ml_signal, change_pct])
-                    else:
-                        print(f"[Screener] No OHLCV data for {pair} on {exchange}")
-                        rows.append([pair, exchange, "--", "--", "--", "--", float('-inf')])
-                except Exception as e:
-                    print(f"[Screener] Error fetching {pair} on {exchange}: {e}")
-                    rows.append([pair, exchange, "--", "--", "--", "--", float('-inf')])
-                # Update status
-                self.run_on_main_thread(lambda idx=idx: status_label.setText(f"Loaded {idx+1}/{len(pairs)} pairs..."))
-            # Sort: ML Signal (BUY > SELL > others), then by change % descending
-            def ml_sort_key(row):
-                signal = row[5].upper()
-                if "BUY" in signal:
-                    return (0, -row[6])
-                elif "SELL" in signal:
-                    return (1, -row[6])
-                else:
-                    return (2, -row[6])
-            rows.sort(key=ml_sort_key)
-            # Populate table in the main thread
-            def update_table():
-                table.setRowCount(len(rows))
-                for i, row in enumerate(rows):
-                    for j, val in enumerate(row[:6]):
-                        item = QTableWidgetItem(str(val))
-                        if j == 3:  # Change %
-                            item.setForeground(Qt.GlobalColor.green if "+" in str(val) else Qt.GlobalColor.red)
-                        if j == 5:  # ML Signal
-                            if "BUY" in str(val).upper():
-                                item.setForeground(Qt.GlobalColor.green)
-                            elif "SELL" in str(val).upper():
-                                item.setForeground(Qt.GlobalColor.red)
-                            else:
-                                item.setForeground(Qt.GlobalColor.gray)
-                        table.setItem(i, j, item)
-                status_label.setText("Done.")
-            self.run_on_main_thread(update_table)
-        threading.Thread(target=fetch_and_populate, daemon=True).start()
-
-        # Filter logic
-        def filter_table():
-            text = filter_input.text().lower()
-            for row in range(table.rowCount()):
-                show = any(text in (table.item(row, col).text().lower() if table.item(row, col) else "") for col in range(table.columnCount()))
-                table.setRowHidden(row, not show)
-        filter_input.textChanged.connect(filter_table)
-
-        # Double-click to select pair
-        def on_row_double_clicked(row, col):
-            pair = table.item(row, 0).text()
-            self.select_pair_button.setText(pair)
-            dialog.accept()
-            self.fetch_data()
-        table.cellDoubleClicked.connect(on_row_double_clicked)
-
-        close_btn = QPushButton("Close")
-        close_btn.clicked.connect(dialog.accept)
-        layout.addWidget(close_btn)
-        dialog.setLayout(layout)
-        dialog.exec()
-
-    def run_on_main_thread(self, func):
-        from PyQt6.QtCore import QTimer
-        QTimer.singleShot(0, func)
-
-    def train_lstm_from_csv(self):
-        from PyQt6.QtWidgets import QFileDialog, QMessageBox, QDialog, QVBoxLayout, QLabel, QSpinBox, QPushButton, QHBoxLayout
-        import pandas as pd
-        import os
-        import numpy as np
-        # --- Dialog for config ---
-        dialog = QDialog(self)
-        dialog.setWindowTitle("Train LSTM from CSV(s)")
-        layout = QVBoxLayout()
-        layout.addWidget(QLabel("Select one or more CSV files with market data."))
-        # Window size
-        window_label = QLabel("LSTM Window Size (optimal suggested):")
-        window_spin = QSpinBox()
-        window_spin.setRange(5, 200)
-        window_spin.setValue(30)  # Optimal default
-        layout.addWidget(window_label)
-        layout.addWidget(window_spin)
-        # Epochs
-        epochs_label = QLabel("Epochs (optimal suggested):")
-        epochs_spin = QSpinBox()
-        epochs_spin.setRange(5, 200)
-        epochs_spin.setValue(30)  # Optimal default
-        layout.addWidget(epochs_label)
-        layout.addWidget(epochs_spin)
-        # File select
-        file_btn = QPushButton("Select CSV Files")
-        file_label = QLabel("No files selected.")
-        layout.addWidget(file_btn)
-        layout.addWidget(file_label)
-        selected_files = []
-        def select_files():
-            files, _ = QFileDialog.getOpenFileNames(dialog, "Select Market Data CSVs", "", "CSV Files (*.csv)")
-            if files:
-                selected_files.clear()
-                selected_files.extend(files)
-                file_label.setText("\n".join(os.path.basename(f) for f in files))
-            else:
-                file_label.setText("No files selected.")
-        file_btn.clicked.connect(select_files)
-        # Train button
-        train_btn = QPushButton("Train LSTM")
-        layout.addWidget(train_btn)
-        # Status label
-        status_label = QLabel()
-        layout.addWidget(status_label)
-        # Close button
-        close_btn = QPushButton("Close")
-        close_btn.clicked.connect(dialog.accept)
-        layout.addWidget(close_btn)
-        dialog.setLayout(layout)
-        # --- Training logic ---
-        def train():
-            if not selected_files:
-                QMessageBox.critical(dialog, "No Files", "Please select at least one CSV file.")
-                return
-            window = window_spin.value()
-            epochs = epochs_spin.value()
-            all_features = []
-            all_targets = []
-            feature_cols = None
-            for file_path in selected_files:
-                try:
-                    df = pd.read_csv(file_path)
-                    required_cols = {"timestamp", "open", "high", "low", "close", "volume"}
-                    if not required_cols.issubset(df.columns):
-                        status_label.setText(f"File {os.path.basename(file_path)} missing required columns.")
-                        return
-                    df = self.add_technical_indicators(df)
-                    # Use same features for all files
-                    if feature_cols is None:
-                        feature_cols = [c for c in df.columns if c not in ['timestamp', 'close']]
-                    features = df[feature_cols].values.astype(np.float32)
-                    targets = df['close'].values.astype(np.float32)
-                    from src.analysis.lstm_regressor import LSTMRegressor
-                    X, y = LSTMRegressor.create_windowed_dataset(features, targets, window)
-                    if X.shape[0] == 0:
-                        status_label.setText(f"File {os.path.basename(file_path)}: Not enough data for window size {window}.")
-                        return
-                    all_features.append(X)
-                    all_targets.append(y)
-                except Exception as e:
-                    status_label.setText(f"Error processing {os.path.basename(file_path)}: {e}")
-                    return
-            # Concatenate all
-            X = np.concatenate(all_features, axis=0)
-            y = np.concatenate(all_targets, axis=0)
-            input_size = X.shape[2] if X.ndim == 3 else len(feature_cols)
-            try:
-                from src.analysis.lstm_regressor import LSTMRegressor
-                model = LSTMRegressor(input_size=input_size)
-                status_label.setText("Training LSTM...")
-                dialog.repaint()
-                model.fit(X, y, epochs=epochs, batch_size=32, lr=1e-3, device=None, verbose=True)
-                model_path = os.path.join("Models", "lstm_from_csv.pt")
-                model.save(model_path)
-                QMessageBox.information(dialog, "LSTM Training", f"LSTM trained and saved to {model_path}")
-                self.ml_analyzer.model = model  # Use for forecasting
-                status_label.setText(f"Training complete. Model saved to {model_path} and ready for forecasting.")
-            except Exception as e:
-                QMessageBox.critical(dialog, "Training Error", f"Error during LSTM training: {e}")
-                status_label.setText(f"Error during training: {e}")
-        train_btn.clicked.connect(train)
-        dialog.exec()
 
     def download_all_pairs_all_timeframes(self):
         from PyQt6.QtWidgets import QDialog, QVBoxLayout, QLabel, QPushButton, QProgressDialog, QMessageBox
@@ -2903,6 +2674,59 @@ You are a quantitative analyst. Analyze the following OHLCV (Open, High, Low, Cl
             QMessageBox.warning(self, "Download Complete (with errors)", f"Some pairs failed to download.\n\n" + "\n".join(errors[:20]) + ("\n..." if len(errors) > 20 else ""))
         else:
             QMessageBox.information(self, "Download Complete", "All pairs downloaded successfully.")
+
+    def train_lstm_from_csv(self):
+        from PyQt6.QtWidgets import QFileDialog, QInputDialog, QMessageBox
+        import os
+        import pandas as pd
+        import numpy as np
+        # Prompt for CSV file
+        file_path, _ = QFileDialog.getOpenFileName(self, "Select CSV File", "", "CSV Files (*.csv)")
+        if not file_path:
+            return
+        # Prompt for pair
+        pair, ok = QInputDialog.getText(self, "Trading Pair", "Enter trading pair (e.g., BTCUSDT):")
+        if not ok or not pair:
+            return
+        # Prompt for timeframe
+        timeframe, ok = QInputDialog.getText(self, "Timeframe", "Enter timeframe (e.g., 1h):")
+        if not ok or not timeframe:
+            return
+        # Load CSV
+        try:
+            df = pd.read_csv(file_path)
+        except Exception as e:
+            QMessageBox.critical(self, "CSV Error", f"Failed to load CSV: {e}")
+            return
+        # Check required columns
+        required_cols = {'timestamp', 'open', 'high', 'low', 'close', 'volume'}
+        if not required_cols.issubset(df.columns):
+            QMessageBox.critical(self, "CSV Error", f"CSV must contain columns: {', '.join(required_cols)}")
+            return
+        # Add technical indicators if needed
+        try:
+            df = self.add_technical_indicators(df)
+        except Exception as e:
+            QMessageBox.critical(self, "Indicator Error", f"Failed to add indicators: {e}")
+            return
+        # Prepare features/targets
+        feature_cols = [c for c in df.columns if c not in ['timestamp', 'close']]
+        features = df[feature_cols].values.astype(np.float32)
+        targets = df['close'].values.astype(np.float32)
+        # Create windowed dataset
+        try:
+            from src.analysis.lstm_regressor import LSTMRegressor
+            window = 30
+            X, y = LSTMRegressor.create_windowed_dataset(features, targets, window)
+            input_size = X.shape[2] if X.ndim == 3 else len(feature_cols)
+            model = LSTMRegressor(input_size=input_size)
+            model.fit(X, y, epochs=30, batch_size=32, lr=1e-3, device=None, verbose=True)
+            norm_pair = pair.replace('/', '-')
+            model_path = os.path.join("Models", f"lstm_{norm_pair}_{timeframe}.pt")
+            model.save(model_path)
+            QMessageBox.information(self, "LSTM Training", f"LSTM model trained and saved to {model_path}")
+        except Exception as e:
+            QMessageBox.critical(self, "LSTM Training Error", f"Failed to train/save LSTM: {e}")
 
 def compute_macd(close: pd.Series, fast: int = 12, slow: int = 26, signal: int = 9) -> pd.DataFrame:
     """
